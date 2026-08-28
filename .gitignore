@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Production and packaged application output
+dist/
+dist-electron/
+server/dist/
+
+# Runtime data and logs
+logs/
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Test and coverage output
+coverage/
+playwright-report/
+test-results/
+
+# Editor and operating system files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Electron-builder files
+builder-debug.yml
+builder-effective-config.yaml
