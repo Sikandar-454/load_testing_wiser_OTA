@@ -9,7 +9,7 @@
     "dev:server": "tsx watch server/src/index.ts",
     "build": "tsc -b && vite build && tsc -p server/tsconfig.json",
     "build:portable": "npm run build && electron-builder --win portable",
-    "start": "node server/dist/index.js"
+    "start": "node --env-file=.env server/dist/index.js"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
