@@ -785,6 +785,7 @@ function RunAllView() {
   const [running, setRunning] = useState(false);
   const [virtualUsers, setVirtualUsers] = useState("25");
   const [scheduleTime, setScheduleTime] = useState("");
+  const [reportRecipients, setReportRecipients] = useState("SESA528360@se.com");
   const [schedule, setSchedule] = useState<{
     startsAt: string;
     runsCompleted: number;
@@ -885,6 +886,7 @@ function RunAllView() {
           startsAt: new Date(scheduleTime).toISOString(),
           virtualUsers: Number(virtualUsers),
           apis: suiteApis.filter((api) => selected.includes(api.name) && api.url),
+          recipients: reportRecipients,
         }),
       });
       const data = await response.json();
@@ -989,6 +991,12 @@ function RunAllView() {
                 value={scheduleTime}
                 onChange={(event) => setScheduleTime(event.target.value)}
                 slotProps={{ inputLabel: { shrink: true } }}
+              />
+              <TextField
+                label="Report email recipients"
+                value={reportRecipients}
+                onChange={(event) => setReportRecipients(event.target.value)}
+                helperText="Separate multiple addresses with commas or semicolons."
               />
               <Typography variant="body2" color="text.secondary">
                 Runs the selected APIs once per hour for 24 hours and emails a Dashboard screenshot after every run.
@@ -1684,6 +1692,26 @@ function MetricsListener() {
   useEffect(() => {
     const socket = io(apiBase, { autoConnect: true });
     socket.on("metrics", useRunStore.getState().setMetrics);
+    socket.on(
+      "capture-dashboard-report",
+      async ({ schedule }: { schedule: { recipients: string[] } }) => {
+        window.dispatchEvent(new Event("show-dashboard-for-report"));
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        try {
+          const screenshot = await captureDashboardScreenshot();
+          const form = new FormData();
+          form.append("screenshot", screenshot, "wiser-dashboard.png");
+          form.append("recipients", schedule.recipients.join(","));
+          const response = await fetch(`${apiBase}/api/reports/scheduled-email`, {
+            method: "POST",
+            body: form,
+          });
+          if (!response.ok) throw new Error((await response.json()).error);
+        } catch (error) {
+          console.error("Scheduled dashboard report failed", error);
+        }
+      },
+    );
     return () => {
       socket.close();
     };

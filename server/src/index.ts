@@ -73,12 +73,20 @@ type SuiteSchedule = {
   runsCompleted: number;
   totalRuns: number;
   status: "Scheduled" | "Running" | "Complete" | "Cancelled";
+  recipients: string[];
 };
 let suiteSchedule: SuiteSchedule | null = null;
 let scheduledSuiteTimer: NodeJS.Timeout | null = null;
 type ImportedUser = { email_id: string; password: string; app_token: string };
 const importedUsers: ImportedUser[] = [];
 const importedJmeterApis: string[] = [];
+const parseRecipients = (value: unknown) =>
+  String(value || "")
+    .split(/[;,\s]+/)
+    .map((email) => email.trim())
+    .filter(Boolean);
+const hasValidRecipients = (recipients: string[]) =>
+  recipients.length > 0 && recipients.every((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
 const resolvePlaceholderValue = (key: string, user: ImportedUser) => {
   const values: Record<string, string> = {
     email_id: user.email_id,
@@ -226,6 +234,9 @@ app.post(
       return response.status(400).json({ error: "A dashboard screenshot is required." });
     if (process.platform !== "win32")
       return response.status(501).json({ error: "Outlook desktop automation is available only on Windows." });
+    const recipients = parseRecipients(request.body.recipients);
+    if (!hasValidRecipients(recipients))
+      return response.status(400).json({ error: "Enter one or more valid report email addresses." });
     const screenshotPath = join(tmpdir(), `wiser-dashboard-${randomUUID()}.png`);
     await writeFile(screenshotPath, request.file.buffer);
     const subject = `WISER scheduled load test report - ${new Date().toLocaleString()}`;
@@ -241,7 +252,7 @@ app.post(
     const script = [
       "$outlook = New-Object -ComObject Outlook.Application",
       "$mail = $outlook.CreateItem(0)",
-      "$mail.To = 'SESA528360@se.com'",
+      `$mail.To = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encode(recipients.join(";"))}'))`,
       `$mail.Subject = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encode(subject)}'))`,
       `$mail.Body = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encode(body)}'))`,
       `$mail.Attachments.Add('${screenshotPath.replace(/'/g, "''")}') | Out-Null`,
@@ -251,7 +262,8 @@ app.post(
       await unlink(screenshotPath).catch(() => undefined);
       if (error)
         return response.status(500).json({ error: "Outlook could not send the scheduled report." });
-      response.json({ message: "Scheduled dashboard report sent." });
+      logger.info("Scheduled dashboard report sent through Outlook", { recipients });
+      response.json({ message: `Scheduled dashboard report sent to ${recipients.join(", ")}.` });
     });
   },
 );
@@ -585,10 +597,13 @@ app.post("/api/suite-schedule", (request, response) => {
   const startsAt = new Date(request.body.startsAt);
   const apis = request.body.apis as ScheduledApi[];
   const virtualUsers = Math.min(Number(request.body.virtualUsers) || 25, 5000);
+  const recipients = parseRecipients(request.body.recipients);
   if (Number.isNaN(startsAt.getTime()) || startsAt.getTime() < Date.now())
     return response.status(400).json({ error: "Choose a future start time." });
   if (!Array.isArray(apis) || !apis.length)
     return response.status(400).json({ error: "Select at least one API to schedule." });
+  if (!hasValidRecipients(recipients))
+    return response.status(400).json({ error: "Enter one or more valid report email addresses." });
   if (scheduledSuiteTimer) clearTimeout(scheduledSuiteTimer);
   suiteSchedule = {
     id: randomUUID(),
@@ -596,6 +611,7 @@ app.post("/api/suite-schedule", (request, response) => {
     runsCompleted: 0,
     totalRuns: 24,
     status: "Scheduled",
+    recipients,
   };
   const isScheduleCancelled = () =>
     !suiteSchedule || suiteSchedule.status === "Cancelled";
