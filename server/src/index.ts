@@ -8,6 +8,10 @@ import { Server } from "socket.io";
 import { createLogger, format, transports } from "winston";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import * as XLSX from "xlsx";
 
 type RunMetrics = {
   activeUsers: number;
@@ -57,8 +61,24 @@ type CapturedResponse = {
   response: unknown;
 };
 const capturedResponses: CapturedResponse[] = [];
+type ScheduledApi = {
+  name: string;
+  url: string;
+  method: string;
+  body?: unknown;
+};
+type SuiteSchedule = {
+  id: string;
+  startsAt: string;
+  runsCompleted: number;
+  totalRuns: number;
+  status: "Scheduled" | "Running" | "Complete" | "Cancelled";
+};
+let suiteSchedule: SuiteSchedule | null = null;
+let scheduledSuiteTimer: NodeJS.Timeout | null = null;
 type ImportedUser = { email_id: string; password: string; app_token: string };
 const importedUsers: ImportedUser[] = [];
+const importedJmeterApis: string[] = [];
 const resolvePlaceholderValue = (key: string, user: ImportedUser) => {
   const values: Record<string, string> = {
     email_id: user.email_id,
@@ -160,7 +180,7 @@ app.post("/api/reports/analytics/email", (_request, response) => {
     `Total API: GET - ${methodTotals.GET} Put - ${methodTotals.PUT} Patch - ${methodTotals.PATCH}`,
     `Total users- ${totalUsers}`,
     `Success rate- ${successRate}`,
-    `Failuer rate - ${failureRate}`,
+    `Failure rate - ${failureRate}`,
     "Thanks",
   ].join("\r\n");
   const emailSubject = "Load testinng for wiser inida";
@@ -170,7 +190,7 @@ app.post("/api/reports/analytics/email", (_request, response) => {
   const script = [
     "$outlook = New-Object -ComObject Outlook.Application",
     "$mail = $outlook.CreateItem(0)",
-    "$mail.To = 'sesa528360@se.com'",
+    "$mail.To = 'SESA528360@se.com'",
     `$mail.Subject = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedSubject}'))`,
     `$mail.Body = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedBody}'))`,
     "$mail.Send()",
@@ -192,12 +212,49 @@ app.post("/api/reports/analytics/email", (_request, response) => {
           });
       }
       logger.info("Analytics email sent through Outlook", {
-        recipient: "sesa528360@se.com",
+        recipient: "SESA528360@se.com",
       });
-      response.json({ message: "Analytics report sent to sesa528360@se.com." });
+      response.json({ message: "Analytics report sent to SESA528360@se.com." });
     },
   );
 });
+app.post(
+  "/api/reports/scheduled-email",
+  upload.single("screenshot"),
+  async (request, response) => {
+    if (!request.file)
+      return response.status(400).json({ error: "A dashboard screenshot is required." });
+    if (process.platform !== "win32")
+      return response.status(501).json({ error: "Outlook desktop automation is available only on Windows." });
+    const screenshotPath = join(tmpdir(), `wiser-dashboard-${randomUUID()}.png`);
+    await writeFile(screenshotPath, request.file.buffer);
+    const subject = `WISER scheduled load test report - ${new Date().toLocaleString()}`;
+    const body = [
+      "Hi Team,",
+      "The hourly WISER load-test suite has completed.",
+      `Requests: ${metrics.totalRequests}`,
+      `Success rate: ${metrics.totalRequests ? ((metrics.success / metrics.totalRequests) * 100).toFixed(2) : "0.00"}%`,
+      "The current dashboard is attached.",
+      "Thanks",
+    ].join("\r\n");
+    const encode = (value: string) => Buffer.from(value, "utf16le").toString("base64");
+    const script = [
+      "$outlook = New-Object -ComObject Outlook.Application",
+      "$mail = $outlook.CreateItem(0)",
+      "$mail.To = 'SESA528360@se.com'",
+      `$mail.Subject = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encode(subject)}'))`,
+      `$mail.Body = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encode(body)}'))`,
+      `$mail.Attachments.Add('${screenshotPath.replace(/'/g, "''")}') | Out-Null`,
+      "$mail.Send()",
+    ].join("; ");
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], async (error) => {
+      await unlink(screenshotPath).catch(() => undefined);
+      if (error)
+        return response.status(500).json({ error: "Outlook could not send the scheduled report." });
+      response.json({ message: "Scheduled dashboard report sent." });
+    });
+  },
+);
 const isSuccessfulResponse = (statusCode: number, payload: unknown) => {
   if (statusCode < 200 || statusCode >= 400) return false;
   if (!payload || typeof payload !== "object") return true;
@@ -517,6 +574,57 @@ app.post("/api/runs/:id/stop", (request, response) => {
   logger.info("Load test run stopped", { id: request.params.id });
   response.json({ metrics });
 });
+app.get("/api/suite-schedule", (_request, response) => response.json(suiteSchedule));
+app.delete("/api/suite-schedule", (_request, response) => {
+  if (scheduledSuiteTimer) clearTimeout(scheduledSuiteTimer);
+  scheduledSuiteTimer = null;
+  if (suiteSchedule) suiteSchedule.status = "Cancelled";
+  response.json(suiteSchedule);
+});
+app.post("/api/suite-schedule", (request, response) => {
+  const startsAt = new Date(request.body.startsAt);
+  const apis = request.body.apis as ScheduledApi[];
+  const virtualUsers = Math.min(Number(request.body.virtualUsers) || 25, 5000);
+  if (Number.isNaN(startsAt.getTime()) || startsAt.getTime() < Date.now())
+    return response.status(400).json({ error: "Choose a future start time." });
+  if (!Array.isArray(apis) || !apis.length)
+    return response.status(400).json({ error: "Select at least one API to schedule." });
+  if (scheduledSuiteTimer) clearTimeout(scheduledSuiteTimer);
+  suiteSchedule = {
+    id: randomUUID(),
+    startsAt: startsAt.toISOString(),
+    runsCompleted: 0,
+    totalRuns: 24,
+    status: "Scheduled",
+  };
+  const isScheduleCancelled = () =>
+    !suiteSchedule || suiteSchedule.status === "Cancelled";
+  const runSuite = async () => {
+    if (isScheduleCancelled()) return;
+    suiteSchedule!.status = "Running";
+    for (const api of apis) {
+      await axios.post(`http://127.0.0.1:${port}/api/runs`, {
+        api: api.name,
+        virtualUsers,
+        mode: "Scheduled",
+        request: { url: api.url, method: api.method, body: api.body },
+      }).catch((error: unknown) => logger.warn("Scheduled API run failed", { api: api.name, error: error instanceof Error ? error.message : String(error) }));
+    }
+    if (isScheduleCancelled()) return;
+    suiteSchedule!.runsCompleted += 1;
+    io.emit("capture-dashboard-report", { schedule: suiteSchedule! });
+    if (suiteSchedule!.runsCompleted >= suiteSchedule!.totalRuns) {
+      suiteSchedule!.status = "Complete";
+      scheduledSuiteTimer = null;
+      return;
+    }
+    suiteSchedule!.status = "Scheduled";
+    scheduledSuiteTimer = setTimeout(runSuite, 60 * 60 * 1000);
+  };
+  scheduledSuiteTimer = setTimeout(runSuite, startsAt.getTime() - Date.now());
+  logger.info("Hourly suite schedule created", { ...suiteSchedule, apis: apis.length });
+  response.status(201).json(suiteSchedule);
+});
 app.post("/api/import/:kind", upload.single("file"), (request, response) => {
   if (!request.file)
     return response.status(400).json({ error: "A file is required." });
@@ -528,24 +636,31 @@ app.post("/api/import/:kind", upload.single("file"), (request, response) => {
       : /\.(csv|txt|xlsx)$/.test(fileName);
   if (!accepted)
     return response.status(415).json({ error: "Unsupported file format." });
-  const text = request.file.buffer.toString("utf8");
   if (kind === "users") {
-    const records = text
-      .split(/\r?\n/)
-      .map((line) => line.split(",").map((value) => value.trim()))
-      .filter(
-        (values) =>
-          values.length >= 3 &&
-          values[0] &&
-          values[1] &&
-          values[2] &&
-          values[0].toLowerCase() !== "email_id",
-      )
-      .map(([email_id, password, app_token]) => ({
-        email_id,
-        password,
-        app_token,
-      }));
+    const workbook = XLSX.read(request.file.buffer, { type: "buffer" });
+    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(firstSheet, {
+      header: 1,
+      defval: "",
+      raw: false,
+    });
+    const header = (rows[0] || []).map((value) =>
+      String(value).trim().toLowerCase(),
+    );
+    const hasHeader = header.includes("email_id");
+    const emailIndex = hasHeader ? header.indexOf("email_id") : 0;
+    const passwordIndex = hasHeader ? header.indexOf("password") : 1;
+    const tokenIndex = hasHeader ? header.indexOf("app_token") : 2;
+    const records = rows
+      .slice(hasHeader ? 1 : 0)
+      .map((row) => ({
+        email_id: String(row[emailIndex] || "").trim(),
+        password: String(row[passwordIndex] || "").trim(),
+        app_token: String(row[tokenIndex] || "").trim(),
+      }))
+      .filter((record) =>
+        Boolean(record.email_id && record.password && record.app_token),
+      );
     const unique = records.filter(
       (record) =>
         !importedUsers.some((user) => user.email_id === record.email_id),
@@ -558,17 +673,42 @@ app.post("/api/import/:kind", upload.single("file"), (request, response) => {
     return response.json({
       message: `${unique.length} user records accepted`,
       count: unique.length,
+      total: importedUsers.length,
+      records: importedUsers,
     });
   }
+  const text = request.file.buffer.toString("utf8");
+  const apis = [...text.matchAll(/<HTTPSamplerProxy\b[^>]*\btestname="([^"]+)"/g)]
+    .map((match) => match[1].trim())
+    .filter(Boolean);
+  const threadGroups = [...text.matchAll(/<ThreadGroup\b[^>]*\btestname="([^"]+)"/g)]
+    .map((match) => match[1].trim())
+    .filter(Boolean);
+  importedJmeterApis.splice(0, importedJmeterApis.length, ...apis);
   const count = (text.match(/HTTPSamplerProxy/g) || []).length;
   logger.info("Import completed", {
     kind,
     file: request.file.originalname,
     count,
   });
-  response.json({ message: `${count} HTTP samplers discovered`, count });
+  response.json({
+    message: `${count} HTTP samplers discovered`,
+    count,
+    threadGroups: threadGroups.length,
+    apis: importedJmeterApis,
+  });
 });
 io.on("connection", (socket) => socket.emit("metrics", metrics));
-server.listen(Number(process.env.PORT) || 3001, () =>
-  logger.info("WISER API service listening on port 3001"),
-);
+const port = Number(process.env.PORT) || 3001;
+server.on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code === "EADDRINUSE") {
+    logger.error(
+      `Port ${port} is already in use. Stop the existing WISER service or start with PORT=<available-port>.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  logger.error("WISER API service could not start", { error: error.message });
+  process.exitCode = 1;
+});
+server.listen(port, () => logger.info(`WISER API service listening on port ${port}`));

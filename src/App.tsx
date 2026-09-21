@@ -783,6 +783,15 @@ const suiteApis = [
 function RunAllView() {
   const [selected, setSelected] = useState(suiteApis.map((api) => api.name));
   const [running, setRunning] = useState(false);
+  const [virtualUsers, setVirtualUsers] = useState("25");
+  const [scheduleTime, setScheduleTime] = useState("");
+  const [schedule, setSchedule] = useState<{
+    startsAt: string;
+    runsCompleted: number;
+    totalRuns: number;
+    status: string;
+  } | null>(null);
+  const [scheduleNotice, setScheduleNotice] = useState("");
   const [logs, setLogs] = useState<
     { api: string; status: string; duration?: number; detail?: string }[]
   >([]);
@@ -793,6 +802,12 @@ function RunAllView() {
         ? items.filter((item) => item !== api)
         : [...items, api],
     );
+  useEffect(() => {
+    fetch(`${apiBase}/api/suite-schedule`)
+      .then((response) => response.json())
+      .then(setSchedule)
+      .catch(() => undefined);
+  }, []);
   const runAll = async () => {
     setRunning(true);
     setLogs(selected.map((api) => ({ api, status: "Queued" })));
@@ -859,6 +874,32 @@ function RunAllView() {
       }
     }
     setRunning(false);
+  };
+  const scheduleHourlySuite = async () => {
+    setScheduleNotice("");
+    try {
+      const response = await fetch(`${apiBase}/api/suite-schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          startsAt: new Date(scheduleTime).toISOString(),
+          virtualUsers: Number(virtualUsers),
+          apis: suiteApis.filter((api) => selected.includes(api.name) && api.url),
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Unable to schedule the suite.");
+      setSchedule(data);
+      setScheduleNotice("Hourly suite scheduled for 24 runs. Each cycle emails a Dashboard screenshot.");
+    } catch (error) {
+      setScheduleNotice(error instanceof Error ? error.message : "Unable to schedule the suite.");
+    }
+  };
+  const cancelSchedule = async () => {
+    const response = await fetch(`${apiBase}/api/suite-schedule`, { method: "DELETE" });
+    const data = await response.json();
+    setSchedule(data);
+    setScheduleNotice("Hourly suite schedule cancelled.");
   };
   return (
     <Stack gap={2.5}>
@@ -929,7 +970,8 @@ function RunAllView() {
               <TextField
                 label="Virtual users"
                 type="number"
-                defaultValue="25"
+                value={virtualUsers}
+                onChange={(event) => setVirtualUsers(event.target.value)}
               />
               <TextField label="Loop count" type="number" defaultValue="10" />
               <TextField
@@ -938,6 +980,45 @@ function RunAllView() {
                 defaultValue="15"
               />
             </Box>
+          </Panel>
+          <Panel title="Hourly report schedule">
+            <Stack gap={1.5}>
+              <TextField
+                label="First run"
+                type="datetime-local"
+                value={scheduleTime}
+                onChange={(event) => setScheduleTime(event.target.value)}
+                slotProps={{ inputLabel: { shrink: true } }}
+              />
+              <Typography variant="body2" color="text.secondary">
+                Runs the selected APIs once per hour for 24 hours and emails a Dashboard screenshot after every run.
+              </Typography>
+              {schedule && schedule.status !== "Cancelled" && schedule.status !== "Complete" && (
+                <Chip
+                  color="secondary"
+                  label={`${schedule.status}: ${schedule.runsCompleted}/${schedule.totalRuns} runs`}
+                />
+              )}
+              {scheduleNotice && <Alert severity="info">{scheduleNotice}</Alert>}
+              <Stack direction="row" gap={1}>
+                <Button
+                  variant="contained"
+                  startIcon={<PlayArrow />}
+                  disabled={!scheduleTime || !selected.length}
+                  onClick={scheduleHourlySuite}
+                >
+                  Schedule hourly
+                </Button>
+                <Button
+                  variant="outlined"
+                  color="error"
+                  disabled={!schedule || schedule.status === "Cancelled" || schedule.status === "Complete"}
+                  onClick={cancelSchedule}
+                >
+                  Cancel schedule
+                </Button>
+              </Stack>
+            </Stack>
           </Panel>
           <Panel title="Suite controls">
             <Stack direction="row" gap={1}>
@@ -1430,6 +1511,17 @@ function AnalyticsView() {
 }
 function ImportView() {
   const [message, setMessage] = useState("");
+  const [showJmeterApis, setShowJmeterApis] = useState(false);
+  const [showImportedUsers, setShowImportedUsers] = useState(false);
+  const [jmeterImport, setJmeterImport] = useState<{
+    count: number;
+    threadGroups: number;
+    apis: string[];
+  } | null>(null);
+  const [userImport, setUserImport] = useState<{
+    total: number;
+    records: { email_id: string; password: string; app_token: string }[];
+  } | null>(null);
   const importFile = async (
     event: React.ChangeEvent<HTMLInputElement>,
     kind: string,
@@ -1444,6 +1536,15 @@ function ImportView() {
     });
     const data = await response.json();
     setMessage(response.ok ? `${file.name}: ${data.message}` : data.error);
+    if (!response.ok) return;
+    if (kind === "jmeter") {
+      setJmeterImport(data);
+      setShowJmeterApis(false);
+    }
+    if (kind === "users") {
+      setUserImport(data);
+      setShowImportedUsers(false);
+    }
   };
   return (
     <Stack gap={2.5}>
@@ -1475,13 +1576,32 @@ function ImportView() {
           </Button>
           <Divider sx={{ my: 3 }} />
           <Box className="import-stat">
-            <b>47</b>
+            {jmeterImport?.count ? (
+              <Button
+                aria-expanded={showJmeterApis}
+                onClick={() => setShowJmeterApis((isOpen) => !isOpen)}
+                sx={{ minWidth: 0, p: 0, fontSize: "inherit", fontWeight: 700 }}
+              >
+                {jmeterImport.count}
+              </Button>
+            ) : (
+              <b>0</b>
+            )}
             <span>APIs discovered</span>
           </Box>
           <Box className="import-stat">
-            <b>6</b>
+            <b>{jmeterImport?.threadGroups ?? 0}</b>
             <span>Thread groups</span>
           </Box>
+          {jmeterImport && showJmeterApis && (
+            <Box component="ul" sx={{ pl: 2.5, mb: 0 }}>
+              {jmeterImport.apis.map((api, index) => (
+                <Typography component="li" key={`${api}-${index}`}>
+                  {api}
+                </Typography>
+              ))}
+            </Box>
+          )}
         </Panel>
         <Panel title="User credentials">
           <Typography color="text.secondary" mb={2}>
@@ -1504,17 +1624,39 @@ function ImportView() {
           </Button>
           <Divider sx={{ my: 3 }} />
           <Box className="import-stat">
-            <b>1,280</b>
+            {userImport?.total ? (
+              <Button
+                aria-expanded={showImportedUsers}
+                onClick={() => setShowImportedUsers((isOpen) => !isOpen)}
+                sx={{ minWidth: 0, p: 0, fontSize: "inherit", fontWeight: 700 }}
+              >
+                {userImport.total}
+              </Button>
+            ) : (
+              <b>0</b>
+            )}
             <span>Total users</span>
           </Box>
-          <Box className="import-stat">
-            <b>3</b>
-            <span>Validation errors</span>
-          </Box>
-          <Box className="import-stat">
-            <b>12</b>
-            <span>Duplicates</span>
-          </Box>
+          {userImport && showImportedUsers && (
+            <Box component="table" className="data-table" sx={{ mt: 2 }}>
+              <thead>
+                <tr>
+                  <th>EMAIL ID</th>
+                  <th>PASSWORD</th>
+                  <th>APP TOKEN</th>
+                </tr>
+              </thead>
+              <tbody>
+                {userImport.records.map((user, index) => (
+                  <tr key={`${user.email_id}-${index}`}>
+                    <td>{user.email_id}</td>
+                    <td>{user.password}</td>
+                    <td>{user.app_token}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </Box>
+          )}
         </Panel>
       </Box>
       <Panel title="Discovered API inventory">
@@ -1551,6 +1693,11 @@ function MetricsListener() {
 function App() {
   const [view, setView] = useState("Dashboard");
   const metrics = useRunStore((state) => state.metrics);
+  useEffect(() => {
+    const showDashboard = () => setView("Dashboard");
+    window.addEventListener("show-dashboard-for-report", showDashboard);
+    return () => window.removeEventListener("show-dashboard-for-report", showDashboard);
+  }, []);
   const page =
     view === "Dashboard" ? (
       <DashboardView />
