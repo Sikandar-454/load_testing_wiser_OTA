@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -21,6 +21,10 @@ import {
   Button,
   Chip,
   CssBaseline,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   Drawer,
   IconButton,
@@ -61,20 +65,41 @@ type Metrics = {
   avgResponse: number;
   status: string;
 };
+type ImportedApi = {
+  id: string;
+  name: string;
+  url: string;
+  method: string;
+  body?: unknown;
+};
 const useRunStore = create<{
   metrics: Metrics;
+  apiCount: number;
+  userCount: number;
+  importedApis: ImportedApi[];
+  environmentUrl: string;
   setMetrics: (metrics: Metrics) => void;
+  setWorkspace: (workspace: { apiCount?: number; userCount?: number }) => void;
+  setImportedApis: (apis: ImportedApi[]) => void;
+  setEnvironmentUrl: (environmentUrl: string) => void;
 }>((set) => ({
   metrics: {
     activeUsers: 0,
-    totalRequests: 12840,
-    success: 12638,
-    failed: 202,
+    totalRequests: 0,
+    success: 0,
+    failed: 0,
     tps: 0,
-    avgResponse: 286,
+    avgResponse: 0,
     status: "Idle",
   },
+  apiCount: 0,
+  userCount: 0,
+  importedApis: [],
+  environmentUrl: "https://wiser-api-otastaging.azurewebsites.net",
   setMetrics: (metrics) => set({ metrics }),
+  setWorkspace: (workspace) => set(workspace),
+  setImportedApis: (apis) => set({ importedApis: apis }),
+  setEnvironmentUrl: (environmentUrl) => set({ environmentUrl }),
 }));
 const nav = [
   ["Dashboard", Dashboard],
@@ -135,6 +160,49 @@ const responses = [
 ];
 const apiBase =
   window.location.protocol === "file:" ? "http://localhost:3001" : "";
+const targetEnvironments = [
+  "https://wiser-api-otastaging.azurewebsites.net",
+  "https://dev-sohaserver.azurewebsites.net",
+  "https://soha-api-staging.azurewebsites.net",
+  "https://api.wiser-support.se.app",
+  "https://wiser-api.azurewebsites.net",
+] as const;
+const environmentLabels: Record<(typeof targetEnvironments)[number], string> = {
+  "https://wiser-api-otastaging.azurewebsites.net": "BLAZE OTA-Staging",
+  "https://dev-sohaserver.azurewebsites.net": "BLAZE Dev",
+  "https://soha-api-staging.azurewebsites.net": "BLAZE Staging",
+  "https://api.wiser-support.se.app": "SE OTA",
+  "https://wiser-api.azurewebsites.net": "Production URL",
+};
+const credentialRequestBody = JSON.stringify(
+  {
+    email_id: "{email_id}",
+    password: "{password}",
+    app_token: "{app_token}",
+  },
+  null,
+  2,
+);
+const replaceApiHost = (url: string, targetBaseUrl: string) => {
+  const source = new URL(url);
+  return `${targetBaseUrl}${source.pathname}${source.search}`;
+};
+const singleApiOptions = [
+  { value: "login", name: "User Login", method: "POST", endpoint: "/v1/user/login" },
+  { value: "register", name: "User Register", method: "POST", endpoint: "/v1/user/register" },
+  { value: "verify", name: "User Verify", method: "POST", endpoint: "/v1/user/{code}/verify" },
+  { value: "logout", name: "User Logout", method: "POST", endpoint: "/v1/user/logout" },
+  { value: "validate", name: "Validate User", method: "GET", endpoint: "/v1/user/{code}/validate" },
+  { value: "oauth-token", name: "OAuth Token", method: "POST", endpoint: "/v1/oauth/token" },
+  { value: "password", name: "User Password", method: "POST", endpoint: "/v1/user/password" },
+  { value: "forgot", name: "Forgot Password", method: "POST", endpoint: "/v1/user/forgot" },
+  { value: "status", name: "User Status", method: "GET", endpoint: "/v1/user/{code}/status" },
+  { value: "reset-password", name: "Reset Password", method: "POST", endpoint: "/v1/user/{verify_forgot_code}/password" },
+  { value: "resend-email", name: "Resend Email", method: "POST", endpoint: "/v1/user/resendemail" },
+  { value: "update-user", name: "Update User", method: "POST", endpoint: "/v1/user/update" },
+  { value: "locations", name: "Get Locations", method: "GET", endpoint: "/v1/location/get" },
+  { value: "devices", name: "Device State", method: "GET", endpoint: "/v1/device/{device_id}/state" },
+] as const;
 function Metric({
   label,
   value,
@@ -182,36 +250,40 @@ function Panel({
     </Paper>
   );
 }
-const ResponseTrendChart = memo(function ResponseTrendChart() {
+const ResponseTrendChart = memo(function ResponseTrendChart({ metrics }: { metrics: Metrics }) {
+  const runMetrics = [
+    { label: "Requests", value: metrics.totalRequests },
+    { label: "Success", value: metrics.success },
+    { label: "Failed", value: metrics.failed },
+    { label: "TPS", value: metrics.tps },
+  ];
   return (
     <Box height={260}>
       <ResponsiveContainer>
-        <AreaChart data={requestTrend}>
-          <defs>
-            <linearGradient id="response" x1="0" x2="0" y1="0" y2="1">
-              <stop stopColor="#087f8c" stopOpacity=".32" />
-              <stop offset="1" stopColor="#087f8c" stopOpacity="0" />
-            </linearGradient>
-          </defs>
+        <BarChart data={runMetrics}>
           <CartesianGrid vertical={false} stroke="#e6ecea" />
-          <XAxis dataKey="time" />
+          <XAxis dataKey="label" />
           <YAxis />
           <Tooltip />
-          <Area type="monotone" dataKey="response" stroke="#087f8c" fill="url(#response)" strokeWidth={2.5} />
-        </AreaChart>
+          <Bar dataKey="value" fill="#087f8c" radius={[3, 3, 0, 0]} />
+        </BarChart>
       </ResponsiveContainer>
     </Box>
   );
 });
-const SystemUtilizationChart = memo(function SystemUtilizationChart() {
+const SystemUtilizationChart = memo(function SystemUtilizationChart({ metrics }: { metrics: Metrics }) {
+  const currentRun = [
+    { label: "Active users", value: metrics.activeUsers },
+    { label: "TPS", value: metrics.tps },
+  ];
   return (
     <Box height={220}>
       <ResponsiveContainer>
-        <BarChart data={requestTrend}>
-          <XAxis dataKey="time" />
+        <BarChart data={currentRun}>
+          <XAxis dataKey="label" />
           <YAxis />
           <Tooltip />
-          <Bar dataKey="tps" fill="#e66a32" radius={[3, 3, 0, 0]} />
+          <Bar dataKey="value" fill="#e66a32" radius={[3, 3, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </Box>
@@ -220,6 +292,8 @@ const SystemUtilizationChart = memo(function SystemUtilizationChart() {
 
 function DashboardView() {
   const metrics = useRunStore((state) => state.metrics);
+  const apiCount = useRunStore((state) => state.apiCount);
+  const userCount = useRunStore((state) => state.userCount);
   return (
     <Stack gap={2.5}>
       <Box>
@@ -228,12 +302,17 @@ function DashboardView() {
           Live health for the WISER API test estate.
         </Typography>
       </Box>
+      {!apiCount && !userCount && (
+        <Alert severity="info">
+          Import a JMeter test plan and user credentials in Import Center to begin testing.
+        </Alert>
+      )}
       <Box className="metric-grid">
-        <Metric label="APIs LOADED" value="47" sub="6 groups configured" />
+        <Metric label="APIs LOADED" value={apiCount} sub="Imported JMeter APIs" />
         <Metric
           label="USERS LOADED"
-          value="1,280"
-          sub="1,217 valid credentials"
+          value={userCount}
+          sub="Imported credentials"
         />
         <Metric
           label="ACTIVE TESTS"
@@ -247,62 +326,53 @@ function DashboardView() {
         />
         <Metric
           label="SUCCESS RATE"
-          value="98.4%"
+          value={metrics.totalRequests ? `${((metrics.success / metrics.totalRequests) * 100).toFixed(1)}%` : "0.0%"}
           sub={`${metrics.success.toLocaleString()} successful`}
         />
         <Metric
           label="AVG RESPONSE"
           value={`${metrics.avgResponse} ms`}
-          sub="P95 612 ms"
+          sub="Current execution"
         />
-        <Metric label="CURRENT TPS" value={metrics.tps} sub="Peak 92.4 TPS" />
+        <Metric label="CURRENT TPS" value={metrics.tps} sub="Current execution" />
         <Metric
           label="PEAK RESPONSE"
-          value="1.84 s"
-          sub="Login / token refresh"
+          value={`${metrics.avgResponse} ms`}
+          sub="Current execution"
         />
       </Box>
       <Box className="two-col">
-        <Panel title="Response time and throughput">
-          <ResponseTrendChart />
+        <Panel title="Run metrics">
+          <ResponseTrendChart metrics={metrics} />
         </Panel>
         <Panel
           title="Live activity"
           action={<Chip size="small" color="success" label="CONNECTED" />}
         >
-          <Stack className="feed" divider={<Divider flexItem />}>
-            <Typography>
-              <b>10:21:08</b> &nbsp; User Login completed in 248 ms
-            </Typography>
-            <Typography>
-              <b>10:21:06</b> &nbsp; Gateway timeout detected for Device State
-            </Typography>
-            <Typography>
-              <b>10:21:00</b> &nbsp; Test run #LT-2026-084 started with 50 users
-            </Typography>
-            <Typography>
-              <b>10:20:48</b> &nbsp; Credentials batch imported: 1,280 users
-            </Typography>
-          </Stack>
+          <Typography color="text.secondary">
+            {metrics.totalRequests
+              ? `${metrics.totalRequests.toLocaleString()} requests recorded in the current run.`
+              : "No test activity yet."}
+          </Typography>
         </Panel>
       </Box>
       <Box className="two-col">
         <Panel title="Recent runs">
-          <RunTable />
+          <RunTable metrics={metrics} />
         </Panel>
         <Panel title="System utilization">
-          <SystemUtilizationChart />
+          <SystemUtilizationChart metrics={metrics} />
           <Stack direction="row" gap={1}>
-            <Chip label="CPU 28%" />
-            <Chip label="Memory 1.4 GB" />
-            <Chip label="Engine healthy" color="success" />
+            <Chip label={`${metrics.activeUsers} active users`} />
+            <Chip label={`${metrics.tps} TPS`} />
+            <Chip label={metrics.status} color={metrics.status === "Running" ? "success" : "default"} />
           </Stack>
         </Panel>
       </Box>
     </Stack>
   );
 }
-function RunTable() {
+function RunTable({ metrics }: { metrics: Metrics }) {
   return (
     <Box component="table" className="data-table">
       <thead>
@@ -314,39 +384,53 @@ function RunTable() {
         </tr>
       </thead>
       <tbody>
-        <tr>
-          <td>LT-2026-084</td>
-          <td>Load</td>
-          <td>12,840</td>
-          <td>
-            <Chip size="small" color="success" label="Complete" />
-          </td>
-        </tr>
-        <tr>
-          <td>LT-2026-083</td>
-          <td>Stress</td>
-          <td>52,106</td>
-          <td>
-            <Chip size="small" color="warning" label="Review" />
-          </td>
-        </tr>
-        <tr>
-          <td>LT-2026-082</td>
-          <td>Baseline</td>
-          <td>5,000</td>
-          <td>
-            <Chip size="small" color="success" label="Complete" />
-          </td>
-        </tr>
+        {metrics.totalRequests ? (
+          <tr>
+            <td>Current</td>
+            <td>Load</td>
+            <td>{metrics.totalRequests.toLocaleString()}</td>
+            <td><Chip size="small" color={metrics.failed ? "warning" : "success"} label={metrics.status} /></td>
+          </tr>
+        ) : (
+          <tr><td colSpan={4}>No runs yet.</td></tr>
+        )}
       </tbody>
     </Box>
   );
 }
 function RunnerView() {
   const [running, setRunning] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
+  const [records, setRecords] = useState<CapturedResponse[]>([]);
+  const [selectedApi, setSelectedApi] = useState("");
+  const [method, setMethod] = useState("GET");
+  const [endpoint, setEndpoint] = useState("");
+  const [requestBody, setRequestBody] = useState(credentialRequestBody);
+  const [virtualUsers, setVirtualUsers] = useState("50");
+  const metrics = useRunStore((state) => state.metrics);
   const setMetrics = useRunStore((state) => state.setMetrics);
+  const importedApis = useRunStore((state) => state.importedApis);
+  const baseUrl = useRunStore((state) => state.environmentUrl);
+  const setEnvironmentUrl = useRunStore((state) => state.setEnvironmentUrl);
+  useEffect(() => {
+    fetch(`${apiBase}/api/responses`)
+      .then((response) => response.json())
+      .then(setRecords)
+      .catch(() => setRecords([]));
+  }, [metrics.totalRequests]);
+  const responseTimes = records
+    .map((record) => record.responseTime)
+    .sort((left, right) => left - right);
+  const p95 = responseTimes.length
+    ? responseTimes[Math.min(responseTimes.length - 1, Math.ceil(responseTimes.length * 0.95) - 1)]
+    : 0;
   const start = async () => {
+    const api = importedApis.find((item) => item.id === selectedApi);
+    if (!api) {
+      setNotice("Import a JMeter test plan and select an API before running.");
+      return;
+    }
     setRunning(true);
     setNotice("");
     try {
@@ -354,17 +438,13 @@ function RunnerView() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          api: "User Login",
-          virtualUsers: 50,
+          api: api.name,
+          virtualUsers: Number(virtualUsers),
           mode: "Load",
           request: {
-            url: "https://api.wiser-support.se.app/v1/user/login",
-            method: "POST",
-            body: {
-              email_id: "{email_id}",
-              password: "{password}",
-              app_token: "{app_token}",
-            },
+            url: `${baseUrl.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`,
+            method,
+            body: requestBody ? JSON.parse(requestBody) : undefined,
           },
         }),
       });
@@ -372,15 +452,30 @@ function RunnerView() {
       if (!response.ok)
         throw new Error(run.error || "The API request could not start.");
       setMetrics(run.metrics);
+      setActiveRunId(run.id);
       setNotice(`Run ${run.id} started using imported user credentials.`);
     } catch (error) {
+      setRunning(false);
       setNotice(
         error instanceof Error
           ? error.message
           : "The API request could not start.",
       );
-    } finally {
+    }
+  };
+  const stop = async () => {
+    if (!activeRunId) return;
+    const response = await fetch(`${apiBase}/api/runs/${activeRunId}/stop`, {
+      method: "POST",
+    });
+    const result = await response.json();
+    if (response.ok) {
+      setMetrics(result.metrics);
       setRunning(false);
+      setActiveRunId(null);
+      setNotice(`Run ${activeRunId} stopped.`);
+    } else {
+      setNotice(result.error || "Unable to stop the API run.");
     }
   };
   return (
@@ -405,40 +500,66 @@ function RunnerView() {
       <Box className="runner-grid">
         <Panel title="Request configuration">
           <Stack gap={2}>
-            <TextField select label="API" defaultValue="login" fullWidth>
-              <MenuItem value="login">User Login</MenuItem>
-              <MenuItem value="register">User Register</MenuItem>
-              <MenuItem value="verify">User Verify</MenuItem>
-              <MenuItem value="logout">User Logout</MenuItem>
-              <MenuItem value="validate">Validate User</MenuItem>
-              <MenuItem value="oauth-token">OAuth Token</MenuItem>
-              <MenuItem value="password">User Password</MenuItem>
-              <MenuItem value="forgot">Forgot Password</MenuItem>
-              <MenuItem value="status">User Status</MenuItem>
-              <MenuItem value="reset-password">Reset Password</MenuItem>
-              <MenuItem value="resend-email">Resend Email</MenuItem>
-              <MenuItem value="update-user">Update User</MenuItem>
-              <MenuItem value="locations">Get Locations</MenuItem>
-              <MenuItem value="devices">Device State</MenuItem>
+            <TextField
+              select
+              label="API"
+              value={selectedApi}
+              onChange={(event) => {
+                const api = importedApis.find((item) => item.id === event.target.value);
+                if (!api) return;
+                const importedUrl = new URL(api.url);
+                setSelectedApi(api.id);
+                setMethod(api.method);
+                setEndpoint(`${importedUrl.pathname}${importedUrl.search}`);
+                setRequestBody(
+                  api.body === undefined
+                    ? api.method.toUpperCase() === "GET"
+                      ? ""
+                      : credentialRequestBody
+                    : JSON.stringify(api.body, null, 2),
+                );
+              }}
+              fullWidth
+              disabled={!importedApis.length}
+            >
+              {importedApis.length === 0 ? (
+                <MenuItem value="">Import a JMeter test plan first</MenuItem>
+              ) : importedApis.map((api) => (
+                <MenuItem key={api.id} value={api.id}>
+                  {api.method} {api.name}
+                </MenuItem>
+              ))}
             </TextField>
             <Box display="grid" gridTemplateColumns="120px 1fr" gap={1.5}>
-              <TextField select label="Method" defaultValue="POST">
+              <TextField select label="Method" value={method} onChange={(event) => setMethod(event.target.value)}>
                 <MenuItem value="POST">POST</MenuItem>
                 <MenuItem value="GET">GET</MenuItem>
               </TextField>
               <TextField
+                select
                 label="Base URL"
-                defaultValue="https://api.wiser-support.se.app"
-              />
+                value={baseUrl}
+                onChange={(event) => {
+                  const environmentUrl = event.target.value as (typeof targetEnvironments)[number];
+                  setEnvironmentUrl(environmentUrl);
+                }}
+              >
+                {targetEnvironments.map((target) => (
+                  <MenuItem key={target} value={target}>{environmentLabels[target]}</MenuItem>
+                ))}
+              </TextField>
             </Box>
-            <TextField label="Endpoint" defaultValue="/v1/user/login" />
+            <TextField
+              label="Endpoint"
+              value={endpoint}
+              onChange={(event) => setEndpoint(event.target.value)}
+            />
             <TextField
               label="Request body (JSON)"
               multiline
               minRows={8}
-              defaultValue={
-                '{\n  "email_id": "{email_id}",\n  "password": "{password}",\n  "app_token": "{app_token}"\n}'
-              }
+              value={requestBody}
+              onChange={(event) => setRequestBody(event.target.value)}
               inputProps={{ style: { fontFamily: "monospace" } }}
             />
             <TextField
@@ -456,7 +577,8 @@ function RunnerView() {
               <TextField
                 label="Virtual users"
                 type="number"
-                defaultValue="50"
+                value={virtualUsers}
+                onChange={(event) => setVirtualUsers(event.target.value)}
               />
               <TextField label="Thread count" type="number" defaultValue="10" />
               <TextField
@@ -494,7 +616,7 @@ function RunnerView() {
                 variant="contained"
                 startIcon={<PlayArrow />}
                 onClick={start}
-                disabled={running}
+                disabled={running || !selectedApi}
               >
                 Run API
               </Button>
@@ -509,7 +631,8 @@ function RunnerView() {
                 color="error"
                 variant="outlined"
                 startIcon={<Stop />}
-                onClick={() => setRunning(false)}
+                onClick={stop}
+                disabled={!running}
               >
                 Stop API
               </Button>
@@ -517,10 +640,10 @@ function RunnerView() {
           </Panel>
           <Panel title="Live metrics">
             <Box className="mini-metrics">
-              <Metric label="REQUESTS" value="2,480" />
-              <Metric label="SUCCESS" value="2,431" />
-              <Metric label="FAILURES" value="49" />
-              <Metric label="P95" value="612 ms" />
+              <Metric label="REQUESTS" value={metrics.totalRequests.toLocaleString()} />
+              <Metric label="SUCCESS" value={metrics.success.toLocaleString()} />
+              <Metric label="FAILURES" value={metrics.failed.toLocaleString()} />
+              <Metric label="P95" value={`${p95} ms`} />
             </Box>
           </Panel>
         </Stack>
@@ -529,12 +652,12 @@ function RunnerView() {
         title="Live request log"
         action={<Chip size="small" label="Auto-scroll" />}
       >
-        <ResponseTable />
+        <ResponseTable records={records} />
       </Panel>
     </Stack>
   );
 }
-function ResponseTable() {
+function ResponseTable({ records }: { records: CapturedResponse[] }) {
   return (
     <Box component="table" className="data-table">
       <thead>
@@ -549,23 +672,25 @@ function ResponseTable() {
         </tr>
       </thead>
       <tbody>
-        {responses.map((row) => (
-          <tr key={`${row.time}-${row.user}`}>
-            <td>{row.time}</td>
+        {records.length === 0 ? (
+          <tr>
+            <td colSpan={7}>No requests captured for this session.</td>
+          </tr>
+        ) : records.map((row) => (
+          <tr key={row.id}>
+            <td>{new Date(row.timestamp).toLocaleTimeString()}</td>
             <td>{row.api}</td>
             <td>{row.user}</td>
             <td>{row.method}</td>
-            <td>{row.code}</td>
-            <td>{row.duration} ms</td>
+            <td>{row.statusCode || "Network error"}</td>
+            <td>{row.responseTime} ms</td>
             <td>
               <Chip
                 size="small"
                 color={
                   row.result === "Success"
                     ? "success"
-                    : row.result === "Failure"
-                      ? "error"
-                      : "warning"
+                    : "error"
                 }
                 label={row.result}
               />
@@ -781,8 +906,12 @@ const suiteApis = [
   { name: "Recommendation Post Action", url: "https://api.wiser-support.se.app/v1/aimlrecom/postrecomaction", method: "POST", body: { action: "accept" } },
 ];
 function RunAllView() {
-  const [selected, setSelected] = useState(suiteApis.map((api) => api.name));
+  const importedApis = useRunStore((state) => state.importedApis);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [selectedMethod, setSelectedMethod] = useState("ALL");
   const [running, setRunning] = useState(false);
+  const activeRunId = useRef<string | null>(null);
+  const stopRequested = useRef(false);
   const [virtualUsers, setVirtualUsers] = useState("25");
   const [scheduleTime, setScheduleTime] = useState("");
   const [reportRecipients, setReportRecipients] = useState("SESA528360@se.com");
@@ -794,15 +923,25 @@ function RunAllView() {
   } | null>(null);
   const [scheduleNotice, setScheduleNotice] = useState("");
   const [logs, setLogs] = useState<
-    { api: string; status: string; duration?: number; detail?: string }[]
+    { id: string; api: string; status: string; duration?: number; detail?: string }[]
   >([]);
   const setMetrics = useRunStore((state) => state.setMetrics);
+  const targetBaseUrl = useRunStore((state) => state.environmentUrl);
+  const setEnvironmentUrl = useRunStore((state) => state.setEnvironmentUrl);
   const toggle = (api: string) =>
     setSelected((items) =>
       items.includes(api)
         ? items.filter((item) => item !== api)
         : [...items, api],
     );
+  const selectByMethod = (method: string) => {
+    setSelectedMethod(method);
+    setSelected(
+      importedApis
+        .filter((api) => method === "ALL" || api.method.toUpperCase() === method)
+        .map((api) => api.id),
+    );
+  };
   useEffect(() => {
     fetch(`${apiBase}/api/suite-schedule`)
       .then((response) => response.json())
@@ -810,14 +949,23 @@ function RunAllView() {
       .catch(() => undefined);
   }, []);
   const runAll = async () => {
+    stopRequested.current = false;
     setRunning(true);
-    setLogs(selected.map((api) => ({ api, status: "Queued" })));
-    for (const name of selected) {
-      const api = suiteApis.find((item) => item.name === name)!;
+    setLogs(selected.map((id) => ({ id, api: importedApis.find((item) => item.id === id)?.name || id, status: "Queued" })));
+    for (const id of selected) {
+      if (stopRequested.current) {
+        setLogs((items) =>
+          items.map((item) =>
+            item.status === "Queued" ? { ...item, status: "Stopped" } : item,
+          ),
+        );
+        break;
+      }
+      const api = importedApis.find((item) => item.id === id)!;
       if (!api.url) {
         setLogs((items) =>
           items.map((item) =>
-            item.api === name
+            item.id === id
               ? {
                   ...item,
                   status: "Needs endpoint",
@@ -831,7 +979,7 @@ function RunAllView() {
       }
       setLogs((items) =>
         items.map((item) =>
-          item.api === name ? { ...item, status: "Running" } : item,
+          item.id === id ? { ...item, status: "Running" } : item,
         ),
       );
       try {
@@ -839,18 +987,19 @@ function RunAllView() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            api: name,
-            virtualUsers: 25,
+            api: api.name,
+            virtualUsers: Number(virtualUsers),
             mode: "Parallel",
-            request: api,
+            request: { ...api, url: replaceApiHost(api.url, targetBaseUrl) },
           }),
         });
         const run = await response.json();
         if (!response.ok) throw new Error(run.error);
+        activeRunId.current = run.id;
         setMetrics(run.metrics);
         setLogs((items) =>
           items.map((item) =>
-            item.api === name
+            item.id === id
               ? {
                   ...item,
                   status: run.response.result,
@@ -862,7 +1011,7 @@ function RunAllView() {
       } catch (error) {
         setLogs((items) =>
           items.map((item) =>
-            item.api === name
+            item.id === id
               ? {
                   ...item,
                   status: "Failed",
@@ -875,6 +1024,17 @@ function RunAllView() {
       }
     }
     setRunning(false);
+    activeRunId.current = null;
+  };
+  const stopAll = async () => {
+    stopRequested.current = true;
+    const runId = activeRunId.current || "suite";
+    const response = await fetch(`${apiBase}/api/runs/${runId}/stop`, {
+      method: "POST",
+    });
+    const result = await response.json();
+    if (response.ok) setMetrics(result.metrics);
+    setRunning(false);
   };
   const scheduleHourlySuite = async () => {
     setScheduleNotice("");
@@ -885,7 +1045,9 @@ function RunAllView() {
         body: JSON.stringify({
           startsAt: new Date(scheduleTime).toISOString(),
           virtualUsers: Number(virtualUsers),
-          apis: suiteApis.filter((api) => selected.includes(api.name) && api.url),
+          apis: importedApis
+            .filter((api) => selected.includes(api.id) && api.url)
+            .map((api) => ({ ...api, url: replaceApiHost(api.url, targetBaseUrl) })),
           recipients: reportRecipients,
         }),
       });
@@ -921,31 +1083,37 @@ function RunAllView() {
         <Panel
           title="API execution plan"
           action={
-            <Button
+            <TextField
+              select
               size="small"
-              onClick={() =>
-                setSelected(
-                  selected.length === suiteApis.length
-                    ? []
-                    : suiteApis.map((api) => api.name),
-                )
-              }
+              label="Select APIs"
+              value={selectedMethod}
+              onChange={(event) => selectByMethod(event.target.value)}
+              disabled={!importedApis.length}
+              sx={{ minWidth: 150 }}
             >
-              Select all
-            </Button>
+              <MenuItem value="ALL">All methods</MenuItem>
+              <MenuItem value="GET">GET only</MenuItem>
+              <MenuItem value="POST">POST only</MenuItem>
+              <MenuItem value="PUT">PUT only</MenuItem>
+            </TextField>
           }
         >
-          <Stack gap={0.5}>
-            {suiteApis.map((api) => (
+          <Stack gap={0.5} sx={{ maxHeight: 650, overflowY: "auto", pr: 1 }}>
+            {importedApis.length === 0 ? (
+              <Typography color="text.secondary" sx={{ p: 2 }}>
+                Import a JMeter test plan to populate the execution plan.
+              </Typography>
+            ) : importedApis.map((api) => (
               <ListItemButton
-                key={api.name}
-                onClick={() => toggle(api.name)}
-                selected={selected.includes(api.name)}
+                key={api.id}
+                onClick={() => toggle(api.id)}
+                selected={selected.includes(api.id)}
               >
                 <ListItemIcon>
                   <input
                     type="checkbox"
-                    checked={selected.includes(api.name)}
+                    checked={selected.includes(api.id)}
                     readOnly
                   />
                 </ListItemIcon>
@@ -953,7 +1121,7 @@ function RunAllView() {
                   primary={api.name}
                   secondary={
                     api.url
-                      ? `${api.method} ${api.url}`
+                      ? `${api.method} ${replaceApiHost(api.url, targetBaseUrl)}`
                           : "Endpoint required from JMeter configuration"
                   }
                 />
@@ -964,6 +1132,19 @@ function RunAllView() {
         <Stack gap={2.5}>
           <Panel title="Suite configuration">
             <Box className="form-grid">
+              <TextField
+                select
+                label="API environment"
+                value={targetBaseUrl}
+                onChange={(event) => {
+                  const environmentUrl = event.target.value as (typeof targetEnvironments)[number];
+                  setEnvironmentUrl(environmentUrl);
+                }}
+              >
+                {targetEnvironments.map((target) => (
+                  <MenuItem key={target} value={target}>{environmentLabels[target]}</MenuItem>
+                ))}
+              </TextField>
               <TextField select label="Execution mode" defaultValue="Parallel">
                 <MenuItem value="Sequential">Sequential</MenuItem>
                 <MenuItem value="Parallel">Parallel</MenuItem>
@@ -1033,7 +1214,7 @@ function RunAllView() {
               <Button
                 variant="contained"
                 startIcon={<PlayArrow />}
-                disabled={running || !selected.length}
+                disabled={running || !selected.length || !importedApis.length}
                 onClick={runAll}
               >
                 Run all ({selected.length})
@@ -1050,6 +1231,7 @@ function RunAllView() {
                 variant="outlined"
                 startIcon={<Stop />}
                 disabled={!running}
+                onClick={stopAll}
               >
                 Stop all
               </Button>
@@ -1061,47 +1243,49 @@ function RunAllView() {
         title="Run all execution log"
         action={<Chip size="small" label={`${logs.length} APIs`} />}
       >
-        <Box component="table" className="data-table">
-          <thead>
-            <tr>
-              <th>API</th>
-              <th>EXECUTION STATUS</th>
-              <th>RESPONSE TIME</th>
-              <th>DETAIL</th>
-            </tr>
-          </thead>
-          <tbody>
-            {logs.length ? (
-              logs.map((log) => (
-                <tr key={log.api}>
-                  <td>{log.api}</td>
-                  <td>
-                    <Chip
-                      size="small"
-                      color={
-                        log.status === "Success"
-                          ? "success"
-                          : log.status === "Running"
-                            ? "warning"
-                            : log.status === "Queued"
-                              ? "default"
-                              : "error"
-                      }
-                      label={log.status}
-                    />
-                  </td>
-                  <td>{log.duration ? `${log.duration} ms` : "-"}</td>
-                  <td>{log.detail || "-"}</td>
-                </tr>
-              ))
-            ) : (
+        <Box sx={{ maxHeight: 1100, overflowY: "auto" }}>
+          <Box component="table" className="data-table">
+            <thead>
               <tr>
-                <td colSpan={4}>
-                  Select APIs and choose Run all to begin capturing suite logs.
-                </td>
+                <th>API</th>
+                <th>EXECUTION STATUS</th>
+                <th>RESPONSE TIME</th>
+                <th>DETAIL</th>
               </tr>
-            )}
-          </tbody>
+            </thead>
+            <tbody>
+              {logs.length ? (
+                logs.map((log) => (
+                  <tr key={log.id}>
+                    <td>{log.api}</td>
+                    <td>
+                      <Chip
+                        size="small"
+                        color={
+                          log.status === "Success"
+                            ? "success"
+                            : log.status === "Running"
+                              ? "warning"
+                              : log.status === "Queued"
+                                ? "default"
+                                : "error"
+                        }
+                        label={log.status}
+                      />
+                    </td>
+                    <td>{log.duration ? `${log.duration} ms` : "-"}</td>
+                    <td>{log.detail || "-"}</td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={4}>
+                    Select APIs and choose Run all to begin capturing suite logs.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </Box>
         </Box>
       </Panel>
     </Stack>
@@ -1304,40 +1488,41 @@ function ResponseViewerView() {
         )}
       </Panel>
       {selected && (
-        <Panel
-          title={`${selected.api} response`}
-          action={
-            <Button
-              size="small"
-              onClick={() =>
-                navigator.clipboard.writeText(
-                  JSON.stringify(selected.response, null, 2),
-                )
-              }
-            >
-              Copy response
+        <Dialog open onClose={() => setSelected(null)} fullWidth maxWidth="lg">
+          <DialogTitle>{selected.api} event details</DialogTitle>
+          <DialogContent dividers>
+            <Box className="two-col">
+              <Box>
+                <Typography variant="subtitle2" fontWeight={700}>
+                  Event sent
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {selected.method} {selected.request.url}
+                </Typography>
+                <Box component="pre" sx={{ mt: 1, mb: 0, p: 2, maxHeight: 420, overflow: "auto", bgcolor: "#102c2a", color: "#dcefe9", borderRadius: 1, fontSize: 12 }}>
+                  {JSON.stringify(selected.request.body ?? {}, null, 2)}
+                </Box>
+              </Box>
+              <Box>
+                <Typography variant="subtitle2" fontWeight={700}>
+                  Event received
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {selected.statusCode || "Network error"} | {selected.responseTime} ms
+                </Typography>
+                <Box component="pre" sx={{ mt: 1, mb: 0, p: 2, maxHeight: 420, overflow: "auto", bgcolor: "#102c2a", color: "#dcefe9", borderRadius: 1, fontSize: 12 }}>
+                  {JSON.stringify(selected.response, null, 2)}
+                </Box>
+              </Box>
+            </Box>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => navigator.clipboard.writeText(JSON.stringify({ request: selected.request, response: selected.response }, null, 2))}>
+              Copy details
             </Button>
-          }
-        >
-          <Typography variant="caption" color="text.secondary">
-            {selected.request.url}
-          </Typography>
-          <Box
-            component="pre"
-            sx={{
-              mt: 1.5,
-              mb: 0,
-              p: 2,
-              overflow: "auto",
-              bgcolor: "#102c2a",
-              color: "#dcefe9",
-              borderRadius: 1,
-              fontSize: 12,
-            }}
-          >
-            {JSON.stringify(selected.response, null, 2)}
-          </Box>
-        </Panel>
+            <Button onClick={() => setSelected(null)}>Close</Button>
+          </DialogActions>
+        </Dialog>
       )}
     </Stack>
   );
@@ -1345,6 +1530,8 @@ function ResponseViewerView() {
 function AnalyticsView() {
   const [emailStatus, setEmailStatus] = useState("");
   const metrics = useRunStore((state) => state.metrics);
+  const environmentUrl = useRunStore((state) => state.environmentUrl);
+  const setEnvironmentUrl = useRunStore((state) => state.setEnvironmentUrl);
   const [records, setRecords] = useState<CapturedResponse[]>([]);
   useEffect(() => {
     fetch(`${apiBase}/api/responses`)
@@ -1410,8 +1597,16 @@ function AnalyticsView() {
         <Select defaultValue="All APIs" size="small">
           <MenuItem value="All APIs">All APIs</MenuItem>
         </Select>
-        <Select defaultValue="Staging" size="small">
-          <MenuItem value="Staging">OTA Staging</MenuItem>
+        <Select
+          value={environmentUrl}
+          size="small"
+          onChange={(event) => setEnvironmentUrl(event.target.value)}
+        >
+          {targetEnvironments.map((target) => (
+            <MenuItem key={target} value={target}>
+              {environmentLabels[target]} ({target})
+            </MenuItem>
+          ))}
         </Select>
         <Button variant="outlined">Last 24 hours</Button>
         <Button
@@ -1524,12 +1719,15 @@ function ImportView() {
   const [jmeterImport, setJmeterImport] = useState<{
     count: number;
     threadGroups: number;
-    apis: string[];
+    apis: ImportedApi[];
   } | null>(null);
   const [userImport, setUserImport] = useState<{
     total: number;
     records: { email_id: string; password: string; app_token: string }[];
   } | null>(null);
+  const setWorkspace = useRunStore((state) => state.setWorkspace);
+  const importedApis = useRunStore((state) => state.importedApis);
+  const setImportedApis = useRunStore((state) => state.setImportedApis);
   const importFile = async (
     event: React.ChangeEvent<HTMLInputElement>,
     kind: string,
@@ -1538,7 +1736,7 @@ function ImportView() {
     if (!file) return;
     const form = new FormData();
     form.append("file", file);
-    const response = await fetch(`/api/import/${kind}`, {
+    const response = await fetch(`${apiBase}/api/import/${kind}`, {
       method: "POST",
       body: form,
     });
@@ -1548,10 +1746,13 @@ function ImportView() {
     if (kind === "jmeter") {
       setJmeterImport(data);
       setShowJmeterApis(false);
+      setWorkspace({ apiCount: data.count });
+      setImportedApis(data.apis);
     }
     if (kind === "users") {
       setUserImport(data);
       setShowImportedUsers(false);
+      setWorkspace({ userCount: data.total });
     }
   };
   return (
@@ -1605,7 +1806,7 @@ function ImportView() {
             <Box component="ul" sx={{ pl: 2.5, mb: 0 }}>
               {jmeterImport.apis.map((api, index) => (
                 <Typography component="li" key={`${api}-${index}`}>
-                  {api}
+                  {api.method} {api.name}
                 </Typography>
               ))}
             </Box>
@@ -1668,7 +1869,30 @@ function ImportView() {
         </Panel>
       </Box>
       <Panel title="Discovered API inventory">
-        <ResponseTable />
+        {importedApis.length === 0 ? (
+          <Typography color="text.secondary">
+            Import a JMeter test plan to view its discovered API requests.
+          </Typography>
+        ) : (
+          <Box component="table" className="data-table">
+            <thead>
+              <tr>
+                <th>API</th>
+                <th>METHOD</th>
+                <th>URL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {importedApis.map((api, index) => (
+                <tr key={`${api.name}-${api.url}-${index}`}>
+                  <td>{api.name}</td>
+                  <td>{api.method}</td>
+                  <td>{api.url}</td>
+                </tr>
+              ))}
+            </tbody>
+          </Box>
+        )}
       </Panel>
     </Stack>
   );
@@ -1692,26 +1916,6 @@ function MetricsListener() {
   useEffect(() => {
     const socket = io(apiBase, { autoConnect: true });
     socket.on("metrics", useRunStore.getState().setMetrics);
-    socket.on(
-      "capture-dashboard-report",
-      async ({ schedule }: { schedule: { recipients: string[] } }) => {
-        window.dispatchEvent(new Event("show-dashboard-for-report"));
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-        try {
-          const screenshot = await captureDashboardScreenshot();
-          const form = new FormData();
-          form.append("screenshot", screenshot, "wiser-dashboard.png");
-          form.append("recipients", schedule.recipients.join(","));
-          const response = await fetch(`${apiBase}/api/reports/scheduled-email`, {
-            method: "POST",
-            body: form,
-          });
-          if (!response.ok) throw new Error((await response.json()).error);
-        } catch (error) {
-          console.error("Scheduled dashboard report failed", error);
-        }
-      },
-    );
     return () => {
       socket.close();
     };
@@ -1721,11 +1925,24 @@ function MetricsListener() {
 function App() {
   const [view, setView] = useState("Dashboard");
   const metrics = useRunStore((state) => state.metrics);
+  const environmentUrl = useRunStore((state) => state.environmentUrl);
+  const setMetrics = useRunStore((state) => state.setMetrics);
+  const setWorkspace = useRunStore((state) => state.setWorkspace);
+  const setImportedApis = useRunStore((state) => state.setImportedApis);
   useEffect(() => {
     const showDashboard = () => setView("Dashboard");
     window.addEventListener("show-dashboard-for-report", showDashboard);
     return () => window.removeEventListener("show-dashboard-for-report", showDashboard);
   }, []);
+  useEffect(() => {
+    fetch(`${apiBase}/api/workspace/reset`, { method: "POST" })
+      .then(() => {
+        setMetrics({ activeUsers: 0, totalRequests: 0, success: 0, failed: 0, tps: 0, avgResponse: 0, status: "Idle" });
+        setWorkspace({ apiCount: 0, userCount: 0 });
+          setImportedApis([]);
+      })
+      .catch(() => undefined);
+        }, [setImportedApis, setMetrics, setWorkspace]);
   const page =
     view === "Dashboard" ? (
       <DashboardView />
@@ -1753,7 +1970,7 @@ function App() {
             WISER <span>Load Testing Suite</span>
           </Typography>
           <Box flexGrow={1} />
-          <Chip className="environment" size="small" label="OTA STAGING" />
+          <Chip className="environment" size="small" label={environmentLabels[environmentUrl as (typeof targetEnvironments)[number]]} />
           <Box className="top-stat">
             <span>RUN STATUS</span>
             <b className={metrics.status === "Running" ? "green" : ""}>

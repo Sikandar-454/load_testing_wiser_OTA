@@ -41,11 +41,11 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 let metrics: RunMetrics = {
   activeUsers: 0,
-  totalRequests: 12840,
-  success: 12638,
-  failed: 202,
+  totalRequests: 0,
+  success: 0,
+  failed: 0,
   tps: 0,
-  avgResponse: 286,
+  avgResponse: 0,
   status: "Idle",
 };
 type CapturedResponse = {
@@ -62,6 +62,7 @@ type CapturedResponse = {
 };
 const capturedResponses: CapturedResponse[] = [];
 type ScheduledApi = {
+  id?: string;
   name: string;
   url: string;
   method: string;
@@ -79,7 +80,12 @@ let suiteSchedule: SuiteSchedule | null = null;
 let scheduledSuiteTimer: NodeJS.Timeout | null = null;
 type ImportedUser = { email_id: string; password: string; app_token: string };
 const importedUsers: ImportedUser[] = [];
-const importedJmeterApis: string[] = [];
+const importedJmeterApis: ScheduledApi[] = [];
+const credentialRequestTemplate = {
+  email_id: "{email_id}",
+  password: "{password}",
+  app_token: "{app_token}",
+};
 const parseRecipients = (value: unknown) =>
   String(value || "")
     .split(/[;,\s]+/)
@@ -87,7 +93,12 @@ const parseRecipients = (value: unknown) =>
     .filter(Boolean);
 const hasValidRecipients = (recipients: string[]) =>
   recipients.length > 0 && recipients.every((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
-const resolvePlaceholderValue = (key: string, user: ImportedUser) => {
+const resolvePlaceholderValue = (
+  key: string,
+  user: ImportedUser,
+  overrides: Record<string, string> = {},
+) => {
+  if (overrides[key]) return overrides[key];
   const values: Record<string, string> = {
     email_id: user.email_id,
     password: user.password,
@@ -109,27 +120,35 @@ const resolvePlaceholderValue = (key: string, user: ImportedUser) => {
   };
   return values[key] ?? "";
 };
-const resolveUserTemplate = (value: unknown, user: ImportedUser): unknown => {
+const resolveUserTemplate = (
+  value: unknown,
+  user: ImportedUser,
+  overrides: Record<string, string> = {},
+): unknown => {
   if (typeof value === "string")
     return value.replace(
       /\{(email_id|password|app_token|code|verify_forgot_code|location_id|loc_id|room_id|guest_id|hub_id|device_id|setting_id|report_type|type|client_id|client_secret)\}/g,
-      (_match, key: string) => resolvePlaceholderValue(key, user),
+      (_match, key: string) => resolvePlaceholderValue(key, user, overrides),
     );
   if (Array.isArray(value))
-    return value.map((item) => resolveUserTemplate(item, user));
+    return value.map((item) => resolveUserTemplate(item, user, overrides));
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         key,
-        resolveUserTemplate(item, user),
+        resolveUserTemplate(item, user, overrides),
       ]),
     );
   return value;
 };
-const resolveTargetUrl = (value: string, user: ImportedUser) =>
+const resolveTargetUrl = (
+  value: string,
+  user: ImportedUser,
+  overrides: Record<string, string> = {},
+) =>
   value.replace(
     /\{(email_id|password|app_token|code|verify_forgot_code|location_id|loc_id|room_id|guest_id|hub_id|device_id|setting_id|report_type|type|client_id|client_secret)\}/g,
-    (_match, key: string) => resolvePlaceholderValue(key, user),
+    (_match, key: string) => resolvePlaceholderValue(key, user, overrides),
   );
 setInterval(() => {
   if (metrics.status === "Running") {
@@ -149,6 +168,22 @@ setInterval(() => {
 app.get("/api/health", (_request, response) =>
   response.json({ status: "healthy", engine: "k6-adapter", metrics }),
 );
+app.post("/api/workspace/reset", (_request, response) => {
+  importedUsers.splice(0, importedUsers.length);
+  importedJmeterApis.splice(0, importedJmeterApis.length);
+  metrics = {
+    activeUsers: 0,
+    totalRequests: 0,
+    success: 0,
+    failed: 0,
+    tps: 0,
+    avgResponse: 0,
+    status: "Idle",
+  };
+  capturedResponses.splice(0, capturedResponses.length);
+  io.emit("metrics", metrics);
+  response.status(204).end();
+});
 app.post("/api/auth/login", (request, response) => {
   const token = jwt.sign(
     { sub: request.body.email || "operator", role: "tester" },
@@ -284,8 +319,21 @@ const parseResponseBody = (body: string): unknown => {
     return body;
   }
 };
-const isWiserApi = (targetUrl: string) =>
-  targetUrl.startsWith("https://api.wiser-support.se.app/v1/");
+const wiserApiHosts = new Set([
+  "wiser-api-otastaging.azurewebsites.net",
+  "dev-sohaserver.azurewebsites.net",
+  "soha-api-staging.azurewebsites.net",
+  "api.wiser-support.se.app",
+  "wiser-api.azurewebsites.net",
+]);
+const isWiserApi = (targetUrl: string) => {
+  try {
+    return wiserApiHosts.has(new URL(targetUrl).hostname);
+  } catch {
+    return false;
+  }
+};
+const wiserApiRoot = (targetUrl: string) => new URL(targetUrl).origin + "/v1";
 app.post("/api/runs", async (request, response) => {
   const id = `LT-${new Date().getFullYear()}-${randomUUID().slice(0, 6).toUpperCase()}`;
   const users = Math.min(Number(request.body.virtualUsers) || 1, 5000);
@@ -301,6 +349,11 @@ app.post("/api/runs", async (request, response) => {
       .json({
         error: "Import a user credentials file before running this API.",
       });
+  const targetPath = new URL(targetUrl).pathname.toLowerCase();
+  const isWiserLogin = isWiserApi(targetUrl) && targetPath === "/v1/user/login";
+  const isWiserOauth = isWiserApi(targetUrl) && targetPath === "/v1/oauth/token";
+  const isWiserPublicEndpoint =
+    /^\/v1\/(user\/(register|verify|forgot|resendemail)|ex\/(user\/login|oauth\/token))/.test(targetPath);
   const publicUserAuthEndpoints = new Set([
     "User Register",
     "User Verify",
@@ -402,50 +455,34 @@ app.post("/api/runs", async (request, response) => {
   ]);
   const requiresWiserAuthentication =
     isWiserApi(targetUrl) &&
-    apiName !== "User Login" &&
-    apiName !== "OAuth Token" &&
-    !publicUserAuthEndpoints.has(apiName) &&
-    (protectedUserEndpoints.has(apiName) ||
-      apiName.startsWith("User ") ||
-      apiName.startsWith("Super ") ||
-      apiName.startsWith("Add ") ||
-      apiName.startsWith("Get ") ||
-      apiName.startsWith("Update ") ||
-      apiName.startsWith("Delete ") ||
-      apiName.startsWith("Location ") ||
-      apiName.startsWith("Device ") ||
-      apiName.startsWith("Hub ") ||
-      apiName.startsWith("Room ") ||
-      apiName.startsWith("Report ") ||
-      apiName.startsWith("Energy ") ||
-      apiName.startsWith("Alert ") ||
-      apiName.startsWith("Upload ") ||
-      apiName.startsWith("External "));
+    !isWiserLogin &&
+    !isWiserOauth &&
+    !isWiserPublicEndpoint;
   const authorization =
-    apiName === "User Login" || requiresWiserAuthentication
+    isWiserLogin || requiresWiserAuthentication
       ? process.env.WISER_LOGIN_AUTHORIZATION
       : undefined;
-  if ((apiName === "User Login" || requiresWiserAuthentication) && !authorization)
+  if ((isWiserLogin || requiresWiserAuthentication) && !authorization)
     return response
       .status(500)
       .json({
         error: "Set WISER_LOGIN_AUTHORIZATION before running WISER APIs.",
       });
-  const credential = importedUsers[0];
-  const resolvedTargetUrl = resolveTargetUrl(targetUrl, credential);
-  const requestBody = resolveUserTemplate(
-    request.body.request?.body,
-    credential,
-  );
   metrics = { ...metrics, activeUsers: users, tps: 0, status: "Running" };
-  const startedAt = performance.now();
-  let statusCode = 0;
-  let payload: unknown;
-  try {
+  const executeForUser = async (credential: ImportedUser): Promise<CapturedResponse> => {
+    const resolvedTargetUrl = resolveTargetUrl(targetUrl, credential);
+    const targetApiRoot = wiserApiRoot(resolvedTargetUrl);
+    const requestTemplate = request.body.request?.body ?? credentialRequestTemplate;
+    let requestBody = resolveUserTemplate(requestTemplate, credential);
+    let executedUrl = resolvedTargetUrl;
+    const startedAt = performance.now();
+    let statusCode = 0;
+    let payload: unknown;
+    try {
     if (requiresWiserAuthentication) {
       const loginAuthorization = authorization!;
       const login = await axios({
-        url: "https://api.wiser-support.se.app/v1/user/login",
+        url: `${targetApiRoot}/user/login`,
         method: "POST",
         headers: { "content-type": "application/json", authorization: loginAuthorization },
         data: credential,
@@ -463,7 +500,7 @@ app.post("/api/runs", async (request, response) => {
           "base64",
         ).toString("utf8").split(":");
         const token = await axios({
-          url: "https://api.wiser-support.se.app/v1/oauth/token",
+          url: `${targetApiRoot}/oauth/token`,
           method: "POST",
           headers: {
             accept: "application/json",
@@ -482,9 +519,9 @@ app.post("/api/runs", async (request, response) => {
           payload = { error: "OAuth token exchange failed.", token: tokenPayload };
         } else {
           let resolvedUrl = resolvedTargetUrl;
-          if (resolvedTargetUrl.includes("{location_id}")) {
+          if (targetUrl.includes("{location_id}")) {
             const locations = await axios({
-              url: "https://api.wiser-support.se.app/v1/location/get",
+              url: `${targetApiRoot}/location/get`,
               method: "GET",
               headers: {
                 accept: "application/json",
@@ -504,10 +541,13 @@ app.post("/api/runs", async (request, response) => {
               statusCode = locations.status;
               payload = { error: "Locations response did not include a location_id.", locations: locationsPayload };
             } else {
-              resolvedUrl = resolvedTargetUrl.replaceAll("{location_id}", encodeURIComponent(locationId));
+              const locationValues = { location_id: locationId };
+              resolvedUrl = resolveTargetUrl(targetUrl, credential, locationValues);
+              requestBody = resolveUserTemplate(requestTemplate, credential, locationValues);
             }
           }
           if (!payload) {
+          executedUrl = resolvedUrl;
           const upstream = await axios({
             url: resolvedUrl,
             method: request.body.request?.method || "GET",
@@ -543,36 +583,64 @@ app.post("/api/runs", async (request, response) => {
       statusCode = upstream.status;
       payload = parseResponseBody(upstream.data);
     }
-  } catch (error) {
-    payload = {
-      error: error instanceof Error ? error.message : "API request failed",
-      detail:
-        error instanceof Error && error.cause instanceof Error
-          ? error.cause.message
-          : undefined,
+    } catch (error) {
+      payload = {
+        error: error instanceof Error ? error.message : "API request failed",
+        detail:
+          error instanceof Error && error.cause instanceof Error
+            ? error.cause.message
+            : undefined,
+      };
+    }
+    const responseTime = Math.round(performance.now() - startedAt);
+    return {
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      api: apiName,
+      user: credential.email_id,
+      method: request.body.request?.method || "POST",
+      statusCode,
+      responseTime,
+      result: isSuccessfulResponse(statusCode, payload) ? "Success" : "Failure",
+      request: {
+        url: executedUrl,
+        body: requestBody,
+      },
+      response: payload,
     };
-  }
-  const responseTime = Math.round(performance.now() - startedAt);
-  const captured: CapturedResponse = {
-    id: randomUUID(),
-    timestamp: new Date().toISOString(),
-    api: apiName,
-    user: credential.email_id,
-    method: request.body.request?.method || "POST",
-    statusCode,
-    responseTime,
-    result: isSuccessfulResponse(statusCode, payload) ? "Success" : "Failure",
-    request: { url: targetUrl, body: requestBody },
-    response: payload,
   };
-  capturedResponses.unshift(captured);
-  capturedResponses.splice(1000);
+  const concurrency = Math.min(users, 25);
+  const captures: CapturedResponse[] = [];
+  let nextUser = 0;
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (nextUser < users) {
+        const userIndex = nextUser++;
+        captures.push(await executeForUser(importedUsers[userIndex % importedUsers.length]));
+      }
+    }),
+  );
+  captures.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+  capturedResponses.unshift(...captures);
+  const captured = captures[0];
+  const successfulRuns = captures.filter((item) => item.result === "Success").length;
+  metrics = {
+    ...metrics,
+    totalRequests: metrics.totalRequests + captures.length,
+    success: metrics.success + successfulRuns,
+    failed: metrics.failed + captures.length - successfulRuns,
+    tps: captures.length,
+    avgResponse: Math.round(
+      captures.reduce((total, item) => total + item.responseTime, 0) / captures.length,
+    ),
+  };
+  io.emit("metrics", metrics);
   logger.info("Load test run started", {
     id,
     api: captured.api,
     mode: request.body.mode,
     users,
-    statusCode,
+    statusCode: captured.statusCode,
   });
   response
     .status(201)
@@ -694,14 +762,36 @@ app.post("/api/import/:kind", upload.single("file"), (request, response) => {
     });
   }
   const text = request.file.buffer.toString("utf8");
-  const apis = [...text.matchAll(/<HTTPSamplerProxy\b[^>]*\btestname="([^"]+)"/g)]
-    .map((match) => match[1].trim())
-    .filter(Boolean);
+  const decodeXml = (value: string) =>
+    value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  const samplerProperty = (sampler: string, property: string) =>
+    decodeXml(
+      sampler.match(new RegExp(`<stringProp name="${property}">([\\s\\S]*?)</stringProp>`))?.[1].trim() || "",
+    );
+  const apis = [...text.matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)]
+    .map((match, index) => {
+      const attributes = match[1];
+      const sampler = match[2];
+      const name = decodeXml(attributes.match(/\btestname="([^"]+)"/)?.[1] || "Unnamed API");
+      const protocol = samplerProperty(sampler, "HTTPSampler.protocol") || "https";
+      const domain = samplerProperty(sampler, "HTTPSampler.domain");
+      const port = samplerProperty(sampler, "HTTPSampler.port");
+      const path = samplerProperty(sampler, "HTTPSampler.path");
+      const body = samplerProperty(sampler, "Argument.value").replace(/\$\{([^}]+)\}/g, "{$1}");
+      return {
+        id: `sampler-${index + 1}`,
+        name,
+        url: domain ? `${protocol}://${domain}${port && port !== "443" ? `:${port}` : ""}${path}` : "",
+        method: samplerProperty(sampler, "HTTPSampler.method") || "GET",
+        ...(body ? { body: parseResponseBody(body) } : {}),
+      };
+    })
+    .filter((api) => api.name && api.url);
   const threadGroups = [...text.matchAll(/<ThreadGroup\b[^>]*\btestname="([^"]+)"/g)]
     .map((match) => match[1].trim())
     .filter(Boolean);
   importedJmeterApis.splice(0, importedJmeterApis.length, ...apis);
-  const count = (text.match(/HTTPSamplerProxy/g) || []).length;
+  const count = apis.length;
   logger.info("Import completed", {
     kind,
     file: request.file.originalname,
