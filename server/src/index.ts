@@ -8,6 +8,8 @@ import { Server } from "socket.io";
 import { createLogger, format, transports } from "winston";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
+import * as XLSX from "xlsx";
 
 type RunMetrics = {
   activeUsers: number;
@@ -54,6 +56,9 @@ let metrics: RunMetrics = {
 };
 type CapturedResponse = {
   id: string;
+  runId: string;
+  mode: string;
+  executed: boolean;
   timestamp: string;
   api: string;
   user: string;
@@ -69,6 +74,15 @@ type CapturedResponse = {
 const capturedResponses: CapturedResponse[] = [];
 type ImportedUser = { email_id: string; password: string; app_token: string };
 const importedUsers: ImportedUser[] = [];
+type ImportedApi = { id: string; name: string; method: string; url: string; enabled: boolean };
+let importedPlan: { fileName: string | null; threadGroups: number; apis: ImportedApi[] } = {
+  fileName: null, threadGroups: 0, apis: [],
+};
+const userImportStats = { fileName: null as string | null, validationErrors: 0, duplicates: 0 };
+const importSummary = () => ({
+  jmeter: { ...importedPlan, apiCount: importedPlan.apis.length },
+  users: { ...userImportStats, total: importedUsers.length },
+});
 const activeRuns = new Map<string, string>();
 const responseTimes: number[] = [];
 let responseTimeTotal = 0;
@@ -640,6 +654,9 @@ app.post("/api/runs", async (request, response) => {
   const responseTime = apiStartedAt === undefined ? 0 : Math.round(finishedAt - apiStartedAt);
   const captured: CapturedResponse = {
     id: randomUUID(),
+    runId: id,
+    mode: request.body.mode || "Single",
+    executed: apiStartedAt !== undefined,
     timestamp: new Date().toISOString(),
     api: apiName,
     user: credential.email_id,
@@ -688,15 +705,83 @@ app.post("/api/runs", async (request, response) => {
 app.get("/api/responses", (_request, response) =>
   response.json(capturedResponses),
 );
+app.get("/api/reports/summary", (request, response) => {
+  const runId = typeof request.query.runId === "string" ? request.query.runId : undefined;
+  const records = runId ? capturedResponses.filter((item) => item.runId === runId) : capturedResponses;
+  if (runId && !records.length)
+    return response.status(404).json({ error: "The selected run has no retained captures." });
+  const executed = records.filter((item) => item.executed);
+  const durations = executed.map((item) => item.responseTime).sort((left, right) => left - right);
+  const percentile = (values: number[], fraction: number) =>
+    values.length ? values[Math.ceil(values.length * fraction) - 1] : null;
+  const success = executed.filter((item) => item.result === "Success").length;
+  const completed = executed.map((item) => Date.parse(item.timestamp)).sort((left, right) => left - right);
+  let peakTps = 0;
+  let first = 0;
+  for (let last = 0; last < completed.length; last++) {
+    while (completed[first] <= completed[last] - 1000) first++;
+    peakTps = Math.max(peakTps, last - first + 1);
+  }
+  const grouped = new Map<string, CapturedResponse[]>();
+  for (const item of executed) {
+    const group = grouped.get(item.api) || [];
+    group.push(item);
+    grouped.set(item.api, group);
+  }
+  const apis = [...grouped].map(([api, items]) => {
+    const times = items.map((item) => item.responseTime).sort((left, right) => left - right);
+    const successful = items.filter((item) => item.result === "Success").length;
+    return {
+      api,
+      requests: items.length,
+      success: successful,
+      failed: items.length - successful,
+      avgResponse: Math.round(times.reduce((total, value) => total + value, 0) / times.length),
+      p95: percentile(times, 0.95),
+    };
+  });
+  const hosts = [...new Set(records.map((item) => new URL(item.request.url).host))];
+  const startedAt = records.length
+    ? new Date(Math.min(...records.map((item) => Date.parse(item.timestamp) - item.totalTime))).toISOString()
+    : null;
+  const endedAt = records.length
+    ? new Date(Math.max(...records.map((item) => Date.parse(item.timestamp)))).toISOString()
+    : null;
+  response.json({
+    generatedAt: new Date().toISOString(),
+    runId: runId || null,
+    recordLimit: 1000,
+    captured: records.length,
+    blocked: records.length - executed.length,
+    totalRequests: executed.length,
+    success,
+    failed: executed.length - success,
+    avgResponse: durations.length ? Math.round(durations.reduce((total, value) => total + value, 0) / durations.length) : null,
+    p95: percentile(durations, 0.95),
+    peakTps,
+    users: new Set(executed.map((item) => item.user)).size,
+    hosts,
+    startedAt,
+    endedAt,
+    durationMs: startedAt && endedAt ? Date.parse(endedAt) - Date.parse(startedAt) : 0,
+    apis,
+    runs: [...new Map(capturedResponses.map((item) => [item.runId, {
+      id: item.runId, api: item.api, mode: item.mode, timestamp: item.timestamp,
+    }])).values()],
+  });
+});
 app.post("/api/runs/:id/stop", (request, response) => {
   metrics = { ...metrics, activeUsers: 0, tps: 0, status: "Stopped" };
   logger.info("Load test run stopped", { id: request.params.id });
   response.json({ metrics });
 });
+app.get("/api/import/summary", (_request, response) => response.json(importSummary()));
 app.post("/api/import/:kind", upload.single("file"), (request, response) => {
   if (!request.file)
     return response.status(400).json({ error: "A file is required." });
   const kind = request.params.kind;
+  if (kind !== "jmeter" && kind !== "users")
+    return response.status(400).json({ error: "Unknown import type." });
   const fileName = request.file.originalname.toLowerCase();
   const accepted =
     kind === "jmeter"
@@ -706,27 +791,43 @@ app.post("/api/import/:kind", upload.single("file"), (request, response) => {
     return response.status(415).json({ error: "Unsupported file format." });
   const text = request.file.buffer.toString("utf8");
   if (kind === "users") {
-    const records = text
-      .split(/\r?\n/)
-      .map((line) => line.split(",").map((value) => value.trim()))
-      .filter(
-        (values) =>
-          values.length >= 3 &&
-          values[0] &&
-          values[1] &&
-          values[2] &&
-          values[0].toLowerCase() !== "email_id",
-      )
-      .map(([email_id, password, app_token]) => ({
-        email_id,
-        password,
-        app_token,
-      }));
-    const unique = records.filter(
-      (record) =>
-        !importedUsers.some((user) => user.email_id === record.email_id),
-    );
+    let rows: unknown[][];
+    try {
+      const workbook = XLSX.read(request.file.buffer, { type: "buffer", raw: true });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      if (!sheet) throw new Error("Missing worksheet.");
+      rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: "", blankrows: false, raw: false });
+    } catch {
+      return response.status(400).json({ error: "The credentials file could not be parsed." });
+    }
+    const header = rows[0]?.map((value) => String(value).trim().toLowerCase()) || [];
+    const hasHeader = header.includes("email_id");
+    const columns = hasHeader ? ["email_id", "password", "app_token"].map((field) => header.indexOf(field)) : [0, 1, 2];
+    if (columns.some((column) => column < 0))
+      return response.status(400).json({ error: "Credentials must include email_id, password, and app_token columns." });
+    const knownEmails = new Set(importedUsers.map((user) => user.email_id.toLowerCase()));
+    const unique: ImportedUser[] = [];
+    let validationErrors = 0;
+    let duplicates = 0;
+    for (const row of rows.slice(hasHeader ? 1 : 0)) {
+      const [email_id, password, app_token] = columns.map((column) => String(row[column] ?? "").trim());
+      if (!email_id && !password && !app_token) continue;
+      if (!/^[^@\s]+@[^@\s]+$/.test(email_id) || !password || !app_token) {
+        validationErrors++;
+        continue;
+      }
+      const emailKey = email_id.toLowerCase();
+      if (knownEmails.has(emailKey)) {
+        duplicates++;
+        continue;
+      }
+      knownEmails.add(emailKey);
+      unique.push({ email_id, password, app_token });
+    }
     importedUsers.push(...unique);
+    userImportStats.fileName = request.file.originalname;
+    userImportStats.validationErrors += validationErrors;
+    userImportStats.duplicates += duplicates;
     recordActivity(`Imported ${unique.length} user credentials.`);
     logger.info("Users imported", {
       file: request.file.originalname,
@@ -735,15 +836,66 @@ app.post("/api/import/:kind", upload.single("file"), (request, response) => {
     return response.json({
       message: `${unique.length} user records accepted`,
       count: unique.length,
+      validationErrors,
+      duplicates,
+      summary: importSummary(),
     });
   }
-  const count = (text.match(/HTTPSamplerProxy/g) || []).length;
+  if (XMLValidator.validate(text) !== true)
+    return response.status(400).json({ error: "The JMeter file contains invalid XML." });
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = new XMLParser({ ignoreAttributes: false, parseTagValue: false, processEntities: false }).parse(text);
+  } catch {
+    return response.status(400).json({ error: "The JMeter file could not be parsed." });
+  }
+  if (!parsed.jmeterTestPlan)
+    return response.status(400).json({ error: "The file is not a JMeter test plan." });
+  const apis: ImportedApi[] = [];
+  let threadGroups = 0;
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    for (const [tag, children] of Object.entries(value)) {
+      if (tag === "HTTPSamplerProxy") {
+        for (const node of Array.isArray(children) ? children : [children]) {
+          if (!node || typeof node !== "object") continue;
+          const sampler = node as Record<string, unknown>;
+          const properties = Array.isArray(sampler.stringProp) ? sampler.stringProp : [sampler.stringProp];
+          const property = (name: string) => {
+            const entry = properties.find((item) => item && typeof item === "object" && item["@_name"] === name);
+            return entry ? String(entry["#text"] ?? "") : "";
+          };
+          const path = property("HTTPSampler.path");
+          const domain = property("HTTPSampler.domain");
+          const port = property("HTTPSampler.port");
+          apis.push({
+            id: String(apis.length + 1),
+            name: String(sampler["@_testname"] || `HTTP request ${apis.length + 1}`),
+            method: property("HTTPSampler.method") || "GET",
+            url: domain ? `${property("HTTPSampler.protocol") || "http"}://${domain}${port ? `:${port}` : ""}${path.startsWith("/") ? "" : "/"}${path}` : path,
+            enabled: sampler["@_enabled"] !== "false",
+          });
+        }
+      }
+      if (/(^|\.)ThreadGroup$/.test(tag))
+        threadGroups += Array.isArray(children) ? children.length : 1;
+      visit(children);
+    }
+  };
+  visit(parsed.jmeterTestPlan);
+  importedPlan = { fileName: request.file.originalname, threadGroups, apis };
+  const count = apis.length;
+  recordActivity(`Imported JMeter plan with ${count} HTTP samplers.`);
   logger.info("Import completed", {
     kind,
     file: request.file.originalname,
     count,
   });
-  response.json({ message: `${count} HTTP samplers discovered`, count });
+  response.json({ message: `${count} HTTP samplers discovered`, count, summary: importSummary() });
 });
 io.on("connection", (socket) => socket.emit("metrics", metrics));
 server.listen(Number(process.env.PORT) || 3002, () =>

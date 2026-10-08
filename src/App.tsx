@@ -51,6 +51,7 @@ import {
   TableChart,
 } from "@mui/icons-material";
 import { create } from "zustand";
+import { utils as spreadsheetUtils } from "xlsx";
 
 type Metrics = {
   activeUsers: number;
@@ -1096,24 +1097,96 @@ function RunAllView() {
     </Stack>
   );
 }
-const reportRows = [
-  ["User Login", "2,480", "98.7%", "248 ms", "612 ms", "0.8%"],
-  ["Get Locations", "2,160", "99.4%", "181 ms", "418 ms", "0.3%"],
-  ["Get Devices", "2,120", "97.8%", "332 ms", "891 ms", "2.2%"],
-  ["Device State", "1,960", "95.1%", "488 ms", "1.84 s", "4.9%"],
-];
+type ReportData = {
+  generatedAt: string;
+  runId: string | null;
+  recordLimit: number;
+  captured: number;
+  blocked: number;
+  totalRequests: number;
+  success: number;
+  failed: number;
+  avgResponse: number | null;
+  p95: number | null;
+  peakTps: number;
+  users: number;
+  hosts: string[];
+  startedAt: string | null;
+  endedAt: string | null;
+  durationMs: number;
+  apis: { api: string; requests: number; success: number; failed: number; avgResponse: number; p95: number }[];
+  runs: { id: string; api: string; mode: string; timestamp: string }[];
+};
 function ReportsView() {
   const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [report, setReport] = useState<ReportData | null>(null);
+  const [runId, setRunId] = useState("");
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    const controller = new AbortController();
+    let pending = false;
+    setLoading(true);
+    setReport(null);
+    setMessage("");
+    const load = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const response = await fetch(`${apiBase}/api/reports/summary${runId ? `?runId=${encodeURIComponent(runId)}` : ""}`, { signal: controller.signal });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Report data could not be loaded.");
+        setReport(data);
+        setError("");
+      } catch (failure) {
+        if (!controller.signal.aborted)
+          setError(failure instanceof Error ? failure.message : "Report data could not be loaded.");
+      } finally {
+        pending = false;
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [runId]);
+  const rate = (count: number, total: number) => total ? `${((count / total) * 100).toFixed(1)}%` : "-";
+  const milliseconds = (value: number | null | undefined) => value == null ? "-" : `${value} ms`;
+  const selectedRun = report?.runs.find((run) => run.id === runId);
   const exportCsv = () => {
-    const csv = [
-      "API,Requests,Success rate,Average,P95,Failure rate",
-      ...reportRows.map((row) => row.join(",")),
-    ].join("\n");
+    if (!report || !report.captured || error || loading) return;
+    const safeText = (value: string) => /^[=+@\-\t\r\n]/.test(value) ? `'${value}` : value;
+    const rows = [
+      ["Scope", runId || "All retained captures"],
+      ["Generated at", report.generatedAt],
+      ["Capture limit", report.recordLimit],
+      ["Captured attempts", report.captured],
+      ["Executed requests", report.totalRequests],
+      ["Successful requests", report.success],
+      ["Failed requests", report.failed],
+      ["Blocked before execution", report.blocked],
+      ["Success rate", rate(report.success, report.totalRequests)],
+      ["Average response (ms)", report.avgResponse ?? ""],
+      ["P95 response (ms)", report.p95 ?? ""],
+      ["Peak TPS", report.peakTps],
+      ["Users executed", report.users],
+      ["Started at", report.startedAt ?? ""],
+      ["Ended at", report.endedAt ?? ""],
+      ["Capture window (ms)", report.durationMs],
+      ["Hosts", report.hosts.join(", ")],
+      [],
+      ["API", "Requests", "Success rate", "Average (ms)", "P95 (ms)", "Failure rate"],
+      ...report.apis.map((api) => [safeText(api.api), api.requests, rate(api.success, api.requests), api.avgResponse, api.p95, rate(api.failed, api.requests)]),
+    ];
+    const csv = spreadsheetUtils.sheet_to_csv(spreadsheetUtils.aoa_to_sheet(rows));
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    link.download = "WISER-load-test-LT-2026-084.csv";
+    link.download = `WISER-report-${runId || "captured"}-${report.generatedAt.replace(/[:.]/g, "-")}.csv`;
     link.click();
-    URL.revokeObjectURL(link.href);
+    window.setTimeout(() => URL.revokeObjectURL(link.href), 0);
     setMessage("CSV report downloaded.");
   };
   return (
@@ -1122,11 +1195,11 @@ function ReportsView() {
         <Box>
           <Typography variant="h4">Reports</Typography>
           <Typography color="text.secondary">
-            Export a complete record of execution LT-2026-084.
+            {loading ? "Loading report..." : report ? `${report.captured.toLocaleString()} captured attempts` : "Report data unavailable."}
           </Typography>
         </Box>
         <Stack direction="row" gap={1}>
-          <Button variant="outlined" onClick={exportCsv}>
+          <Button variant="outlined" onClick={exportCsv} disabled={loading || !!error || !report?.captured}>
             Export CSV
           </Button>
           <Button variant="outlined" disabled>
@@ -1137,50 +1210,59 @@ function ReportsView() {
           </Button>
         </Stack>
       </Box>
+      <TextField
+        select
+        label="Run"
+        value={runId}
+        onChange={(event) => setRunId(event.target.value)}
+        disabled={loading}
+        size="small"
+        sx={{ maxWidth: 480 }}
+      >
+        <MenuItem value="">All retained captures</MenuItem>
+        {!!runId && !report?.runs.some((run) => run.id === runId) && <MenuItem value={runId}>{runId}</MenuItem>}
+        {report?.runs.map((run) => <MenuItem key={run.id} value={run.id}>{run.id} / {run.api}</MenuItem>)}
+      </TextField>
+      {error && <Alert severity="error">{error}</Alert>}
       {message && <Alert severity="success">{message}</Alert>}
       <Box className="metric-grid">
         <Metric
-          label="EXECUTION RUN"
-          value="LT-2026-084"
-          sub="Load / OTA Staging"
+          label="REPORT SCOPE"
+          value={runId || "Retained captures"}
+          sub={selectedRun?.mode || (report ? `${report.captured.toLocaleString()} attempts` : undefined)}
         />
-        <Metric label="TOTAL REQUESTS" value="12,840" sub="50 virtual users" />
-        <Metric label="SUCCESS RATE" value="98.4%" sub="12,638 successful" />
-        <Metric label="AVG RESPONSE" value="286 ms" sub="P95: 612 ms" />
-        <Metric label="PEAK TPS" value="92.4" sub="at 10:18:43" />
-        <Metric label="FAILURES" value="202" sub="1.6% of requests" />
-        <Metric label="DURATION" value="05:00" sub="Completed" />
-        <Metric label="ENVIRONMENT" value="Staging" sub="Wiser OTA" />
+        <Metric label="TOTAL REQUESTS" value={report?.totalRequests.toLocaleString() ?? "-"} sub={report ? `${report.users} users executed` : undefined} />
+        <Metric label="SUCCESS RATE" value={report ? rate(report.success, report.totalRequests) : "-"} sub={report ? `${report.success.toLocaleString()} successful` : undefined} />
+        <Metric label="AVG RESPONSE" value={milliseconds(report?.avgResponse)} sub={`P95: ${milliseconds(report?.p95)}`} />
+        <Metric label="PEAK TPS" value={report?.peakTps ?? "-"} sub="Within captured requests" />
+        <Metric label="FAILURES" value={report?.failed.toLocaleString() ?? "-"} sub={report ? rate(report.failed, report.totalRequests) : undefined} />
+        <Metric label="CAPTURE WINDOW" value={report?.startedAt ? `${(report.durationMs / 1000).toFixed(1)} s` : "-"} sub={report?.startedAt ? new Date(report.startedAt).toLocaleString() : undefined} />
+        <Metric label="TARGET HOSTS" value={report?.hosts.length ?? "-"} sub={report?.hosts.join(", ") || undefined} />
       </Box>
       <Box className="two-col">
         <Panel title="Execution summary">
           <Stack gap={1.5}>
             <Typography>
-              Run <b>LT-2026-084</b> completed with stable throughput across 50
-              virtual users.
+              {report ? `${report.totalRequests.toLocaleString()} executed requests: ${report.success.toLocaleString()} successful, ${report.failed.toLocaleString()} failed.` : "No report data available."}
             </Typography>
             <Typography color="text.secondary">
-              Most APIs met the 500 ms response target. Device State requires
-              attention because its P95 latency exceeds the target.
+              {report ? `${report.blocked.toLocaleString()} attempts were blocked before endpoint execution.` : "-"}
             </Typography>
-            <Alert severity="warning">
-              Recommendation: review the Device State dependency before raising
-              this profile above 50 concurrent users.
-            </Alert>
+            {!!report?.failed && <Alert severity="warning">{report.failed.toLocaleString()} executed requests failed.</Alert>}
           </Stack>
         </Panel>
-        <Panel title="Included in export">
+        <Panel title="Capture scope">
           <Stack gap={1}>
-            <Typography>Execution summary and configuration</Typography>
-            <Typography>API-level response times and percentiles</Typography>
-            <Typography>Failures, status codes, and recommendations</Typography>
-            <Typography>Response-time and throughput trend charts</Typography>
+            <Typography>{report ? `Latest ${report.recordLimit.toLocaleString()} captures retained by the engine.` : "-"}</Typography>
+            <Typography>Start: {report?.startedAt ? new Date(report.startedAt).toLocaleString() : "-"}</Typography>
+            <Typography>End: {report?.endedAt ? new Date(report.endedAt).toLocaleString() : "-"}</Typography>
+            <Typography>{report ? `${report.apis.length} APIs with executed requests` : "-"}</Typography>
           </Stack>
         </Panel>
       </Box>
       <Panel
         title="API statistics"
-        action={<Chip size="small" color="success" label="Completed" />}
+        action={<Chip size="small" label={loading ? "Loading" : error ? "Unavailable" : report?.captured ? "Recorded" : "No captures"} />}
       >
         <Box component="table" className="data-table">
           <thead>
@@ -1194,13 +1276,16 @@ function ReportsView() {
             </tr>
           </thead>
           <tbody>
-            {reportRows.map((row) => (
-              <tr key={row[0]}>
-                {row.map((value) => (
-                  <td key={value}>{value}</td>
-                ))}
+            {report?.apis.length ? report.apis.map((api) => (
+              <tr key={api.api}>
+                <td>{api.api}</td>
+                <td>{api.requests.toLocaleString()}</td>
+                <td>{rate(api.success, api.requests)}</td>
+                <td>{milliseconds(api.avgResponse)}</td>
+                <td>{milliseconds(api.p95)}</td>
+                <td>{rate(api.failed, api.requests)}</td>
               </tr>
-            ))}
+            )) : <tr><td colSpan={6}>{loading ? "Loading..." : error ? "Report data unavailable." : "No executed requests recorded."}</td></tr>}
           </tbody>
         </Box>
       </Panel>
@@ -1506,22 +1591,69 @@ function AnalyticsView() {
     </Stack>
   );
 }
+type ImportSummary = {
+  jmeter: {
+    fileName: string | null;
+    apiCount: number;
+    threadGroups: number;
+    apis: { id: string; name: string; method: string; url: string; enabled: boolean }[];
+  };
+  users: { fileName: string | null; total: number; validationErrors: number; duplicates: number };
+};
 function ImportView() {
   const [message, setMessage] = useState("");
+  const [severity, setSeverity] = useState<"success" | "warning" | "error">("success");
+  const [summary, setSummary] = useState<ImportSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [importing, setImporting] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = async () => {
+      try {
+        const response = await fetch(`${apiBase}/api/import/summary`, { signal: controller.signal });
+        if (!response.ok) throw new Error("Import data could not be loaded.");
+        setSummary(await response.json());
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setSeverity("error");
+          setMessage(error instanceof Error ? error.message : "Import data could not be loaded.");
+        }
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    };
+    void load();
+    return () => controller.abort();
+  }, []);
   const importFile = async (
     event: React.ChangeEvent<HTMLInputElement>,
     kind: string,
   ) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    event.target.value = "";
+    setImporting(kind);
+    setMessage("");
     const form = new FormData();
     form.append("file", file);
-    const response = await fetch(`/api/import/${kind}`, {
-      method: "POST",
-      body: form,
-    });
-    const data = await response.json();
-    setMessage(response.ok ? `${file.name}: ${data.message}` : data.error);
+    try {
+      const response = await fetch(`${apiBase}/api/import/${kind}`, {
+        method: "POST",
+        body: form,
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Import failed.");
+      setSummary(data.summary);
+      setSeverity(data.validationErrors || data.duplicates ? "warning" : "success");
+      setMessage(kind === "users"
+        ? `${file.name}: ${data.count} accepted, ${data.validationErrors} invalid, ${data.duplicates} duplicates.`
+        : `${file.name}: ${data.message}`);
+    } catch (error) {
+      setSeverity("error");
+      setMessage(error instanceof Error ? error.message : "Import failed.");
+    } finally {
+      setImporting(null);
+    }
   };
   return (
     <Stack gap={2.5}>
@@ -1531,19 +1663,19 @@ function ImportView() {
           Bring JMeter plans and credential pools into the workspace.
         </Typography>
       </Box>
-      {message && <Alert severity="info">{message}</Alert>}
+      {message && <Alert severity={severity}>{message}</Alert>}
       <Box className="two-col">
         <Panel title="JMeter test plan">
           <Typography color="text.secondary" mb={2}>
-            Upload a `.jmx` file to extract thread groups, controllers, HTTP
-            requests, headers, and variables.
+            {loading ? "Loading..." : summary?.jmeter.fileName || "No test plan imported."}
           </Typography>
           <Button
             component="label"
             variant="contained"
             startIcon={<CloudUpload />}
+            disabled={loading || importing !== null}
           >
-            Import JMeter file
+            {importing === "jmeter" ? "Importing..." : "Import JMeter file"}
             <input
               hidden
               type="file"
@@ -1553,26 +1685,26 @@ function ImportView() {
           </Button>
           <Divider sx={{ my: 3 }} />
           <Box className="import-stat">
-            <b>47</b>
+            <b>{summary?.jmeter.apiCount.toLocaleString() ?? "-"}</b>
             <span>APIs discovered</span>
           </Box>
           <Box className="import-stat">
-            <b>6</b>
+            <b>{summary?.jmeter.threadGroups.toLocaleString() ?? "-"}</b>
             <span>Thread groups</span>
           </Box>
         </Panel>
         <Panel title="User credentials">
           <Typography color="text.secondary" mb={2}>
-            Import CSV, TXT, or Excel fields in `email_id,password,app_token`
-            format. Credentials stay encrypted at rest.
+            {loading ? "Loading..." : summary?.users.fileName || "No credentials imported."}
           </Typography>
           <Button
             component="label"
             variant="contained"
             color="secondary"
             startIcon={<CloudUpload />}
+            disabled={loading || importing !== null}
           >
-            Import users
+            {importing === "users" ? "Importing..." : "Import users"}
             <input
               hidden
               type="file"
@@ -1582,21 +1714,44 @@ function ImportView() {
           </Button>
           <Divider sx={{ my: 3 }} />
           <Box className="import-stat">
-            <b>1,280</b>
+            <b>{summary?.users.total.toLocaleString() ?? "-"}</b>
             <span>Total users</span>
           </Box>
           <Box className="import-stat">
-            <b>3</b>
+            <b>{summary?.users.validationErrors.toLocaleString() ?? "-"}</b>
             <span>Validation errors</span>
           </Box>
           <Box className="import-stat">
-            <b>12</b>
+            <b>{summary?.users.duplicates.toLocaleString() ?? "-"}</b>
             <span>Duplicates</span>
           </Box>
         </Panel>
       </Box>
       <Panel title="Discovered API inventory">
-        <ResponseTable />
+        <Box sx={{ overflowX: "auto" }}>
+          <Box component="table" className="data-table">
+            <thead>
+              <tr>
+                <th>API</th>
+                <th>METHOD</th>
+                <th>ENDPOINT</th>
+                <th>STATUS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary?.jmeter.apis.length ? summary.jmeter.apis.map((api) => (
+                <tr key={api.id}>
+                  <td>{api.name}</td>
+                  <td>{api.method}</td>
+                  <td>{api.url || "-"}</td>
+                  <td><Chip size="small" label={api.enabled ? "Enabled" : "Disabled"} /></td>
+                </tr>
+              )) : (
+                <tr><td colSpan={4}>{loading ? "Loading..." : summary ? "No APIs imported." : "Import data unavailable."}</td></tr>
+              )}
+            </tbody>
+          </Box>
+        </Box>
       </Panel>
     </Stack>
   );
