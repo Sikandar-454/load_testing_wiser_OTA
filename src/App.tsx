@@ -59,22 +59,34 @@ type Metrics = {
   failed: number;
   tps: number;
   avgResponse: number;
+  activeTests: number;
+  p95: number;
+  peakResponse: number;
+  peakTps: number;
   status: string;
 };
 const useRunStore = create<{
   metrics: Metrics;
   setMetrics: (metrics: Metrics) => void;
+  connected: boolean;
+  setConnected: (connected: boolean) => void;
 }>((set) => ({
   metrics: {
     activeUsers: 0,
-    totalRequests: 12840,
-    success: 12638,
-    failed: 202,
+    totalRequests: 0,
+    success: 0,
+    failed: 0,
     tps: 0,
-    avgResponse: 286,
+    avgResponse: 0,
+    activeTests: 0,
+    p95: 0,
+    peakResponse: 0,
+    peakTps: 0,
     status: "Idle",
   },
-  setMetrics: (metrics) => set({ metrics }),
+  setMetrics: (metrics) => set((state) => ({ metrics: { ...state.metrics, ...metrics } })),
+  connected: false,
+  setConnected: (connected) => set({ connected }),
 }));
 const nav = [
   ["Dashboard", Dashboard],
@@ -87,14 +99,14 @@ const nav = [
   ["Run History", History],
   ["Settings", Settings],
 ] as const;
-const requestTrend = [
-  { time: "09:00", response: 210, tps: 38 },
-  { time: "09:05", response: 265, tps: 54 },
-  { time: "09:10", response: 238, tps: 74 },
-  { time: "09:15", response: 322, tps: 61 },
-  { time: "09:20", response: 276, tps: 88 },
-  { time: "09:25", response: 284, tps: 80 },
-];
+type DashboardData = {
+  metrics: Metrics;
+  usersLoaded: number;
+  recentRuns: { id: string; api: string; mode: string; requests: number; result: string; timestamp: string }[];
+  activity: { timestamp: string; message: string }[];
+  trend: { timestamp: string; response: number; tps: number; cpu: number; memory: number }[];
+  utilization: { cpu: number; memory: number };
+};
 const responses = [
   {
     time: "10:21:08",
@@ -134,7 +146,7 @@ const responses = [
   },
 ];
 const apiBase =
-  window.location.protocol === "file:" ? "http://localhost:3001" : "";
+  window.location.protocol === "file:" ? "http://localhost:3002" : "";
 function Metric({
   label,
   value,
@@ -182,11 +194,11 @@ function Panel({
     </Paper>
   );
 }
-const ResponseTrendChart = memo(function ResponseTrendChart() {
+const ResponseTrendChart = memo(function ResponseTrendChart({ data }: { data: DashboardData["trend"] }) {
   return (
     <Box height={260}>
       <ResponsiveContainer>
-        <AreaChart data={requestTrend}>
+        <AreaChart data={data}>
           <defs>
             <linearGradient id="response" x1="0" x2="0" y1="0" y2="1">
               <stop stopColor="#087f8c" stopOpacity=".32" />
@@ -194,24 +206,26 @@ const ResponseTrendChart = memo(function ResponseTrendChart() {
             </linearGradient>
           </defs>
           <CartesianGrid vertical={false} stroke="#e6ecea" />
-          <XAxis dataKey="time" />
-          <YAxis />
+          <XAxis dataKey="timestamp" tickFormatter={(value) => new Date(value).toLocaleTimeString()} />
+          <YAxis yAxisId="response" />
+          <YAxis yAxisId="tps" orientation="right" />
           <Tooltip />
-          <Area type="monotone" dataKey="response" stroke="#087f8c" fill="url(#response)" strokeWidth={2.5} />
+          <Area yAxisId="response" name="Average response (ms)" type="monotone" dataKey="response" stroke="#087f8c" fill="url(#response)" strokeWidth={2.5} />
+          <Area yAxisId="tps" name="Requests/sec" type="monotone" dataKey="tps" stroke="#e66a32" fill="transparent" strokeWidth={2} />
         </AreaChart>
       </ResponsiveContainer>
     </Box>
   );
 });
-const SystemUtilizationChart = memo(function SystemUtilizationChart() {
+const SystemUtilizationChart = memo(function SystemUtilizationChart({ data }: { data: DashboardData["trend"] }) {
   return (
     <Box height={220}>
       <ResponsiveContainer>
-        <BarChart data={requestTrend}>
-          <XAxis dataKey="time" />
+        <BarChart data={data}>
+          <XAxis dataKey="timestamp" tickFormatter={(value) => new Date(value).toLocaleTimeString()} />
           <YAxis />
           <Tooltip />
-          <Bar dataKey="tps" fill="#e66a32" radius={[3, 3, 0, 0]} />
+          <Bar dataKey="cpu" name="Process CPU (%)" fill="#e66a32" radius={[3, 3, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </Box>
@@ -220,6 +234,32 @@ const SystemUtilizationChart = memo(function SystemUtilizationChart() {
 
 function DashboardView() {
   const metrics = useRunStore((state) => state.metrics);
+  const setMetrics = useRunStore((state) => state.setMetrics);
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const response = await fetch(`${apiBase}/api/dashboard`, { signal: controller.signal });
+        if (!response.ok) throw new Error("Dashboard data could not be loaded.");
+        const snapshot: DashboardData = await response.json();
+        if (controller.signal.aborted) return;
+        setData(snapshot);
+        setMetrics(snapshot.metrics);
+        setError("");
+      } catch (failure) {
+        if (!controller.signal.aborted)
+          setError(failure instanceof Error ? failure.message : "Dashboard data could not be loaded.");
+      } finally {
+        if (!controller.signal.aborted) timer = setTimeout(refresh, 2000);
+      }
+    };
+    void refresh();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [setMetrics]);
+  const successRate = metrics.totalRequests ? `${((metrics.success / metrics.totalRequests) * 100).toFixed(1)}%` : "-";
   return (
     <Stack gap={2.5}>
       <Box>
@@ -228,81 +268,73 @@ function DashboardView() {
           Live health for the WISER API test estate.
         </Typography>
       </Box>
+      {error && <Alert severity="error">{error}</Alert>}
       <Box className="metric-grid">
-        <Metric label="APIs LOADED" value="47" sub="6 groups configured" />
+        <Metric label="APIs CONFIGURED" value={suiteApis.length} sub="Available in execution plan" />
         <Metric
           label="USERS LOADED"
-          value="1,280"
-          sub="1,217 valid credentials"
+          value={data ? data.usersLoaded.toLocaleString() : "-"}
+          sub="Imported credentials"
         />
         <Metric
           label="ACTIVE TESTS"
-          value={metrics.status === "Running" ? 1 : 0}
+          value={metrics.activeTests}
           sub={metrics.status}
         />
         <Metric
           label="REQUESTS EXECUTED"
           value={metrics.totalRequests.toLocaleString()}
-          sub="Current execution"
+          sub="Since engine start"
         />
         <Metric
           label="SUCCESS RATE"
-          value="98.4%"
+          value={successRate}
           sub={`${metrics.success.toLocaleString()} successful`}
         />
         <Metric
           label="AVG RESPONSE"
           value={`${metrics.avgResponse} ms`}
-          sub="P95 612 ms"
+          sub={`P95 ${metrics.p95} ms`}
         />
-        <Metric label="CURRENT TPS" value={metrics.tps} sub="Peak 92.4 TPS" />
+        <Metric label="CURRENT TPS" value={metrics.tps} sub={`Peak ${metrics.peakTps} TPS`} />
         <Metric
           label="PEAK RESPONSE"
-          value="1.84 s"
-          sub="Login / token refresh"
+          value={`${metrics.peakResponse} ms`}
+          sub="Measured endpoint latency"
         />
       </Box>
       <Box className="two-col">
         <Panel title="Response time and throughput">
-          <ResponseTrendChart />
+          {metrics.totalRequests ? <ResponseTrendChart data={data?.trend ?? []} /> : <Typography color="text.secondary">No requests executed yet.</Typography>}
         </Panel>
         <Panel
           title="Live activity"
-          action={<Chip size="small" color="success" label="CONNECTED" />}
+          action={<Chip size="small" color={data && !error ? "success" : "default"} label={error ? "DISCONNECTED" : data ? "CONNECTED" : "CONNECTING"} />}
         >
           <Stack className="feed" divider={<Divider flexItem />}>
-            <Typography>
-              <b>10:21:08</b> &nbsp; User Login completed in 248 ms
-            </Typography>
-            <Typography>
-              <b>10:21:06</b> &nbsp; Gateway timeout detected for Device State
-            </Typography>
-            <Typography>
-              <b>10:21:00</b> &nbsp; Test run #LT-2026-084 started with 50 users
-            </Typography>
-            <Typography>
-              <b>10:20:48</b> &nbsp; Credentials batch imported: 1,280 users
-            </Typography>
+            {data?.activity.length ? data.activity.slice(0, 5).map((item, index) => (
+              <Typography key={`${item.timestamp}-${index}`}><b>{new Date(item.timestamp).toLocaleTimeString()}</b> &nbsp; {item.message}</Typography>
+            )) : <Typography color="text.secondary">No activity recorded yet.</Typography>}
           </Stack>
         </Panel>
       </Box>
       <Box className="two-col">
         <Panel title="Recent runs">
-          <RunTable />
+          <RunTable runs={data?.recentRuns ?? []} />
         </Panel>
-        <Panel title="System utilization">
-          <SystemUtilizationChart />
+        <Panel title="Engine process utilization">
+          <SystemUtilizationChart data={data?.trend ?? []} />
           <Stack direction="row" gap={1}>
-            <Chip label="CPU 28%" />
-            <Chip label="Memory 1.4 GB" />
-            <Chip label="Engine healthy" color="success" />
+            <Chip label={data ? `CPU ${data.utilization.cpu}%` : "CPU -"} />
+            <Chip label={data ? `Memory ${data.utilization.memory} MB` : "Memory -"} />
+            <Chip label={error ? "Engine unavailable" : data ? "Engine healthy" : "Connecting"} color={data && !error ? "success" : "default"} />
           </Stack>
         </Panel>
       </Box>
     </Stack>
   );
 }
-function RunTable() {
+function RunTable({ runs }: { runs: DashboardData["recentRuns"] }) {
   return (
     <Box component="table" className="data-table">
       <thead>
@@ -314,30 +346,13 @@ function RunTable() {
         </tr>
       </thead>
       <tbody>
-        <tr>
-          <td>LT-2026-084</td>
-          <td>Load</td>
-          <td>12,840</td>
-          <td>
-            <Chip size="small" color="success" label="Complete" />
-          </td>
-        </tr>
-        <tr>
-          <td>LT-2026-083</td>
-          <td>Stress</td>
-          <td>52,106</td>
-          <td>
-            <Chip size="small" color="warning" label="Review" />
-          </td>
-        </tr>
-        <tr>
-          <td>LT-2026-082</td>
-          <td>Baseline</td>
-          <td>5,000</td>
-          <td>
-            <Chip size="small" color="success" label="Complete" />
-          </td>
-        </tr>
+        {runs.length ? runs.slice(0, 5).map((run) => (
+          <tr key={run.id}>
+            <td>{run.id}<Typography variant="caption" display="block">{run.api}</Typography></td>
+            <td>{run.mode}</td><td>{run.requests}</td>
+            <td><Chip size="small" color={run.result === "Success" ? "success" : "error"} label={run.result} /></td>
+          </tr>
+        )) : <tr><td colSpan={4}>No runs recorded yet.</td></tr>}
       </tbody>
     </Box>
   );
@@ -654,8 +669,7 @@ const suiteApis = [
     url: "https://api.wiser-support.se.app/v1/user/{verify_forgot_code}/password",
     method: "POST",
     body: {
-      password: "{password}",
-      confirm_password: "{password}",
+      verifyForgotCode: "{verify_forgot_code}",
     },
   },
   {
@@ -672,8 +686,7 @@ const suiteApis = [
     url: "https://api.wiser-support.se.app/v1/user/{code}/user",
     method: "PUT",
     body: {
-      email_id: "{email_id}",
-      app_token: "{app_token}",
+      code: "{code}",
     },
   },
   {
@@ -689,7 +702,7 @@ const suiteApis = [
   { name: "User Update", url: "https://api.wiser-support.se.app/v1/user/update", method: "POST", body: { email_id: "{email_id}", app_token: "{app_token}" } },
   { name: "User Change", url: "https://api.wiser-support.se.app/v1/user/change", method: "POST", body: { email_id: "{email_id}", password: "{password}" } },
   { name: "Update User Email", url: "https://api.wiser-support.se.app/v1/user/updateemail", method: "POST", body: { email_id: "{email_id}", new_email: "{email_id}" } },
-  { name: "Federated Id Map", url: "https://api.wiser-support.se.app/v1/user/federatedId/map", method: "POST", body: { user_id: "{code}", federated_id: "{code}" } },
+  { name: "Federated Id Map", url: "https://api.wiser-support.se.app/v1/user/federatedId/map", method: "POST", body: { user_id: "{user_id}", federated_id: "{federated_id}" } },
   { name: "Delete User", url: "https://api.wiser-support.se.app/v1/user/delete", method: "PUT", body: { code: "{code}" } },
   { name: "Add Guest User", url: "https://api.wiser-support.se.app/v1/user/addGuest", method: "POST", body: { email_id: "{email_id}", app_token: "{app_token}" } },
   { name: "Get Guest User", url: "https://api.wiser-support.se.app/v1/user/getGuest", method: "GET" },
@@ -708,8 +721,8 @@ const suiteApis = [
   { name: "Location Settings", url: "https://api.wiser-support.se.app/v1/location/{location_id}/settings", method: "GET" },
   { name: "Get Location Preference", url: "https://api.wiser-support.se.app/v1/location/preference/{location_id}/get", method: "GET" },
   { name: "Update Location Preference", url: "https://api.wiser-support.se.app/v1/location/preference/{location_id}/update", method: "POST", body: { preference: "notification", value: true } },
-  { name: "Location Devices", url: "https://api.wiser-support.se.app/v1/location/device/{location_id}/get", method: "GET" },
-  { name: "All Location Devices", url: "https://api.wiser-support.se.app/v1/location/device/{location_id}/all", method: "GET" },
+  { name: "Location Devices", url: "https://api.wiser-support.se.app/v1/location/device/{location_id}/get", method: "GET", headers: { locationId: "{location_id}" } },
+  { name: "All Location Devices", url: "https://api.wiser-support.se.app/v1/location/device/{location_id}/all", method: "GET", headers: { locationId: "{location_id}" } },
   { name: "Device State", url: "https://api.wiser-support.se.app/v1/device/{device_id}/state", method: "GET" },
   { name: "Update Device Status", url: "https://api.wiser-support.se.app/v1/device/{device_id}/status", method: "POST", body: { status: "active" } },
   { name: "Device Details", url: "https://api.wiser-support.se.app/v1/device/{device_id}/details", method: "GET" },
@@ -724,11 +737,11 @@ const suiteApis = [
   { name: "Hub Count", url: "https://api.wiser-support.se.app/v1/hub/count", method: "GET" },
   { name: "Get Hub By ID", url: "https://api.wiser-support.se.app/v1/hub/{hub_id}/get", method: "GET" },
   { name: "Hub Devices Count", url: "https://api.wiser-support.se.app/v1/devices/{hub_id}/count", method: "GET" },
-  { name: "Add Device To Hub", url: "https://api.wiser-support.se.app/v1/devices/{hub_id}/add", method: "POST", body: { device_name: "Device 1", app_token: "{app_token}" } },
+  { name: "Add Device To Hub", url: "https://api.wiser-support.se.app/v1/devices/{hub_id}/add", method: "POST", body: { hubId: "{hub_id}", device_name: "Device 1", app_token: "{app_token}" } },
   { name: "Get Devices By Hub", url: "https://api.wiser-support.se.app/v1/devices/{hub_id}/get", method: "GET" },
   { name: "Get Device By Hub", url: "https://api.wiser-support.se.app/v1/device/{hub_id}/get/{device_id}", method: "GET" },
-  { name: "Update Device By Hub", url: "https://api.wiser-support.se.app/v1/device/{hub_id}/update/{device_id}", method: "POST", body: { device_name: "Updated Device", status: "active" } },
-  { name: "Delete Device By Hub", url: "https://api.wiser-support.se.app/v1/devices/{hub_id}/delete/{device_id}", method: "POST", body: { reason: "test-delete" } },
+  { name: "Update Device By Hub", url: "https://api.wiser-support.se.app/v1/device/{hub_id}/update/{device_id}", method: "POST", body: { hubId: "{hub_id}", deviceId: "{device_id}", device_name: "Updated Device", status: "active" } },
+  { name: "Delete Device By Hub", url: "https://api.wiser-support.se.app/v1/devices/{hub_id}/delete/{device_id}", method: "POST", body: { hubId: "{hub_id}", deviceId: "{device_id}", reason: "test-delete" } },
   { name: "Upload Room Image", url: "https://api.wiser-support.se.app/v1/upload/{room_id}/room/image", method: "POST", body: { file: "room-image.jpg" } },
   { name: "Location Event State", url: "https://api.wiser-support.se.app/v1/location/event/{location_id}/state", method: "GET" },
   { name: "Device Event State", url: "https://api.wiser-support.se.app/v1/event/{device_id}/state", method: "GET" },
@@ -776,13 +789,16 @@ const suiteApis = [
   { name: "External Device Configuration", url: "https://api.wiser-support.se.app/v1/ex/events/device-configuration/{device_id}", method: "GET" },
   { name: "AIML Get All Tips", url: "https://api.wiser-support.se.app/v1/aiml/getalltips", method: "GET" },
   { name: "AIML Get Action Tips", url: "https://api.wiser-support.se.app/v1/aiml/getactionbasedtips", method: "GET" },
-  { name: "AIML Post Tip Action", url: "https://api.wiser-support.se.app/v1/aiml/posttipaction", method: "POST", body: { action: "view" } },
+  { name: "AIML Post Tip Action", url: "https://api.wiser-support.se.app/v1/aiml/posttipaction", method: "POST", headers: { user_id: "{user_id}" }, body: { msgId: "{msg_id}", action_reason: "{action_reason}" } },
   { name: "Recommendation Get All", url: "https://api.wiser-support.se.app/v1/aimlrecom/getallrecommendation", method: "GET" },
   { name: "Recommendation Post Action", url: "https://api.wiser-support.se.app/v1/aimlrecom/postrecomaction", method: "POST", body: { action: "accept" } },
 ];
 function RunAllView() {
   const [selected, setSelected] = useState(suiteApis.map((api) => api.name));
   const [running, setRunning] = useState(false);
+  const [error, setError] = useState("");
+  const [executionMode, setExecutionMode] = useState("Parallel");
+  const [concurrency, setConcurrency] = useState(5);
   const [logs, setLogs] = useState<
     { api: string; status: string; duration?: number; detail?: string }[]
   >([]);
@@ -795,8 +811,11 @@ function RunAllView() {
     );
   const runAll = async () => {
     setRunning(true);
+    setError("");
     setLogs(selected.map((api) => ({ api, status: "Queued" })));
-    for (const name of selected) {
+    let blocked = false;
+    const executeApi = async (name: string) => {
+      if (blocked) return;
       const api = suiteApis.find((item) => item.name === name)!;
       if (!api.url) {
         setLogs((items) =>
@@ -811,7 +830,7 @@ function RunAllView() {
               : item,
           ),
         );
-        continue;
+        return;
       }
       setLogs((items) =>
         items.map((item) =>
@@ -825,13 +844,33 @@ function RunAllView() {
           body: JSON.stringify({
             api: name,
             virtualUsers: 25,
-            mode: "Parallel",
+            mode: executionMode,
             request: api,
           }),
+          signal: AbortSignal.timeout(90000),
         });
         const run = await response.json();
+        if (response.status === 400) {
+          blocked = true;
+          const message = run.error || "Check the run configuration before retrying.";
+          setError(message);
+          setLogs((items) =>
+            items.map((item) =>
+              item.status === "Queued" || item.api === name
+                ? { ...item, status: "Blocked", detail: message }
+                : item,
+            ),
+          );
+          return;
+        }
         if (!response.ok) throw new Error(run.error);
         setMetrics(run.metrics);
+        const payload = run.response.response;
+        const failureReason = payload && typeof payload === "object"
+          ? [payload.message, payload.error, payload.detail].find(
+              (value) => typeof value === "string" && value.length > 0,
+            ) || (payload.msg_count === 0 ? "No matching report or event data was returned (msg_count: 0)." : undefined)
+          : undefined;
         setLogs((items) =>
           items.map((item) =>
             item.api === name
@@ -839,6 +878,9 @@ function RunAllView() {
                   ...item,
                   status: run.response.result,
                   duration: run.response.responseTime,
+                  detail: run.response.result === "Failure"
+                    ? `${run.response.statusCode ? `HTTP ${run.response.statusCode}` : "Request error"}: ${failureReason || (run.response.statusCode === 404 ? "Endpoint or resource not found; verify the API route and configured IDs." : "Inspect the captured response in API Response Viewer.")}`
+                    : undefined,
                 }
               : item,
           ),
@@ -857,8 +899,27 @@ function RunAllView() {
           ),
         );
       }
+    };
+    const limit = executionMode === "Sequential" ? 1 : Math.max(1, Math.min(20, Math.floor(concurrency) || 1));
+    const canRunConcurrently = (name: string) => {
+      const api = suiteApis.find((item) => item.name === name)!;
+      return api.method === "GET" && !/\/(?:logout|verify|validate|activate)(?:\/|$)/.test(api.url);
+    };
+    try {
+      let next = 0;
+      while (next < selected.length && !blocked) {
+        if (limit === 1 || !canRunConcurrently(selected[next])) {
+          await executeApi(selected[next++]);
+          continue;
+        }
+        const batch: string[] = [];
+        while (next < selected.length && batch.length < limit && canRunConcurrently(selected[next]))
+          batch.push(selected[next++]);
+        await Promise.all(batch.map(executeApi));
+      }
+    } finally {
+      setRunning(false);
     }
-    setRunning(false);
   };
   return (
     <Stack gap={2.5}>
@@ -874,12 +935,14 @@ function RunAllView() {
           label={running ? "EXECUTING" : "READY"}
         />
       </Box>
+      {error && <Alert severity="error">{error}</Alert>}
       <Box className="runner-grid">
         <Panel
           title="API execution plan"
           action={
             <Button
               size="small"
+              disabled={running}
               onClick={() =>
                 setSelected(
                   selected.length === suiteApis.length
@@ -896,6 +959,7 @@ function RunAllView() {
             {suiteApis.map((api) => (
               <ListItemButton
                 key={api.name}
+                disabled={running}
                 onClick={() => toggle(api.name)}
                 selected={selected.includes(api.name)}
               >
@@ -921,11 +985,25 @@ function RunAllView() {
         <Stack gap={2.5}>
           <Panel title="Suite configuration">
             <Box className="form-grid">
-              <TextField select label="Execution mode" defaultValue="Parallel">
+              <TextField
+                select
+                label="Execution mode"
+                value={executionMode}
+                onChange={(event) => setExecutionMode(event.target.value)}
+                disabled={running}
+              >
                 <MenuItem value="Sequential">Sequential</MenuItem>
                 <MenuItem value="Parallel">Parallel</MenuItem>
                 <MenuItem value="Stress">Stress</MenuItem>
               </TextField>
+              <TextField
+                label="Concurrent API requests"
+                type="number"
+                value={concurrency}
+                onChange={(event) => setConcurrency(Math.max(1, Math.min(20, Number(event.target.value) || 1)))}
+                inputProps={{ min: 1, max: 20, step: 1 }}
+                disabled={running || executionMode === "Sequential"}
+              />
               <TextField
                 label="Virtual users"
                 type="number"
@@ -1542,15 +1620,51 @@ function MetricsListener() {
   useEffect(() => {
     const socket = io(apiBase, { autoConnect: true });
     socket.on("metrics", useRunStore.getState().setMetrics);
+    socket.on("connect", () => useRunStore.getState().setConnected(true));
+    socket.on("disconnect", () => useRunStore.getState().setConnected(false));
+    socket.on("connect_error", () => useRunStore.getState().setConnected(false));
     return () => {
       socket.close();
+      useRunStore.getState().setConnected(false);
     };
   }, []);
   return null;
 }
+function EngineConnection() {
+  const connected = useRunStore((state) => state.connected);
+  return (
+    <Box className="engine-status">
+      <span className="led" style={{ backgroundColor: connected ? "#158a55" : "#b54545" }} /> Engine {connected ? "connected" : "disconnected"}
+    </Box>
+  );
+}
+function LiveRunStats() {
+  const metrics = useRunStore((state) => state.metrics);
+  return (
+    <>
+      <Box className="top-stat">
+        <span>RUN STATUS</span>
+        <b className={metrics.status === "Running" ? "green" : ""}>
+          {metrics.status}
+        </b>
+      </Box>
+      <Box className="top-stat">
+        <span>ACTIVE USERS</span>
+        <b>{metrics.activeUsers}</b>
+      </Box>
+      <Box className="top-stat">
+        <span>TPS</span>
+        <b>{metrics.tps}</b>
+      </Box>
+      <Box className="top-stat">
+        <span>AVG RESPONSE</span>
+        <b>{metrics.avgResponse} ms</b>
+      </Box>
+    </>
+  );
+}
 function App() {
   const [view, setView] = useState("Dashboard");
-  const metrics = useRunStore((state) => state.metrics);
   const page =
     view === "Dashboard" ? (
       <DashboardView />
@@ -1579,24 +1693,7 @@ function App() {
           </Typography>
           <Box flexGrow={1} />
           <Chip className="environment" size="small" label="OTA STAGING" />
-          <Box className="top-stat">
-            <span>RUN STATUS</span>
-            <b className={metrics.status === "Running" ? "green" : ""}>
-              {metrics.status}
-            </b>
-          </Box>
-          <Box className="top-stat">
-            <span>ACTIVE USERS</span>
-            <b>{metrics.activeUsers}</b>
-          </Box>
-          <Box className="top-stat">
-            <span>TPS</span>
-            <b>{metrics.tps}</b>
-          </Box>
-          <Box className="top-stat">
-            <span>AVG RESPONSE</span>
-            <b>{metrics.avgResponse} ms</b>
-          </Box>
+          <LiveRunStats />
         </Toolbar>
       </AppBar>
       <Drawer className="drawer" variant="permanent">
@@ -1617,11 +1714,7 @@ function App() {
           ))}
         </List>
         <Box flexGrow={1} />
-        <Box className="engine-status">
-          <span className="led" /> Engine connected
-          <br />
-          <small>v1.0.0</small>
-        </Box>
+        <EngineConnection />
       </Drawer>
       <Box component="main" className="content">
         <Toolbar />
